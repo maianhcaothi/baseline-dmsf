@@ -4,20 +4,19 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# Large binary files
-*.pt
+# Media / docs — không push
 *.mp4
 *.avi
 *.mov
+*.pdf
+*.ipynb
 
 # Runtime outputs
 *.log
 *.npy
-metrics_raw_*.csv
-metrics_pivoted_dmsf.csv
+*.csv
 utilization.log
 utilization.md
-src/utilization.md
 
 # Machine-specific
 config.yaml

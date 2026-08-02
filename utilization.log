@@ -1,3 +1,0 @@
-role,client_id,utilization,packages,busy_ns,total_ns
-edge,ab14dd52,0.462278,1,6152630509,13309359501
-cloud,1887c555,0.680634,2,14761665377,21688104281
