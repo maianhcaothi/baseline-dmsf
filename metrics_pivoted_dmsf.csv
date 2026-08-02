@@ -1,0 +1,3 @@
+batch_id,batch_size,best_cut,edge_latency_ms,edge_fps,edge_ram_mb,edge_message_size_bytes,cloud_latency_ms,cloud_fps,cloud_ram_mb,cloud_message_size_bytes,e2e_latency_ms
+0,32,7,6033.422,0.0,718.164,3343445,10769.67,0.0,727.2,3343445,16966.731
+1,29,7,,,,,3990.68,7.96,1026.961,3030092,8345.478

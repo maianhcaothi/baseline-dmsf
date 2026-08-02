@@ -1,0 +1,18 @@
+{
+  "edge_device": "s9_dev2",
+  "cloud_device": "s10_dev1",
+  "batch_size": 32,
+  "edge_times_ms": {
+    "3": 3.771214,
+    "5": 5.1622140000000005,
+    "7": 5.814592,
+    "10": 6.991506
+  },
+  "cloud_times_ms": {
+    "3": 2.271178,
+    "5": 1.9395660000000001,
+    "7": 1.796019,
+    "10": 1.532861
+  },
+  "note": "Preloaded from lab profiling (yolo26n backbone approx for DMSF26n)"
+}
