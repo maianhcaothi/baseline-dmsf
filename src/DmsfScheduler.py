@@ -13,6 +13,12 @@ from utils.metrics import non_max_suppression
 
 INTERMEDIATE_QUEUE = 'dmsf_intermediate_queue'
 METRICS_EXCHANGE   = 'dmsf_metrics_fanout'
+UTILIZATION_QUEUE  = 'utilization_queue'
+
+# This baseline runs a single edge->cloud cluster. The result format is written
+# cluster-generic anyway (guide 01 §3.2-3.3), so an N-cluster variant only has to
+# hand each device a different id here — every log, roll-up and chart follows.
+CLUSTER_ID = f"{INTERMEDIATE_QUEUE}_0"
 
 
 class DmsfScheduler:
@@ -40,8 +46,18 @@ class DmsfScheduler:
         self._fps_batch_sizes = []
         self._fps_system = None   # set by _finish_fps(), used by _pivot_and_save()
 
+        # Raw per-unit latency samples, shipped to the server at shutdown and
+        # pooled there (04 §1). Devices never pre-reduce: the mean of two
+        # devices' p95 values is not the p95 of their combined population.
+        #   pipeline = in-stage residency, everything from the unit entering
+        #              this stage to it leaving. Contains `service`, which is
+        #              only the get input -> output span.
+        #   e2e      = edge start -> cloud output, reported by the cloud alone.
+        self._pipeline_ms = []
+        self._e2e_ms = []
+
         self.channel.queue_declare(queue=INTERMEDIATE_QUEUE, durable=False)
-        self.channel.queue_declare(queue='utilization_queue', durable=False)
+        self.channel.queue_declare(queue=UTILIZATION_QUEUE, durable=False)
 
     # ---------------------------------------------------------------------- #
     # Metrics
@@ -80,10 +96,18 @@ class DmsfScheduler:
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
 
+        batch_open_ns = None      # when this unit's first frame entered the stage
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            if not buf:
+                # The unit starts existing here. Frame decode + resize for the
+                # whole batch sits between this and `get input`, so it is inside
+                # `pipeline` and outside `service` — that gap is exactly the
+                # buffering this stage adds.
+                batch_open_ns = time.time_ns()
             frame = cv2.resize(frame, (imgsz, imgsz))
             t = torch.from_numpy(frame[:, :, ::-1].copy()).float() / 255.0
             buf.append(t.permute(2, 0, 1))
@@ -107,8 +131,12 @@ class DmsfScheduler:
 
             self.channel.basic_publish(exchange='', routing_key=INTERMEDIATE_QUEUE, body=msg)
 
+            out_ns = time.time_ns()
             with open(self._timing_log_edge, "a") as _tf:
-                print(str(time.time_ns()) + " output", file=_tf)
+                print(str(out_ns) + " output", file=_tf)
+            if batch_open_ns is not None:
+                self._pipeline_ms.append((out_ns - batch_open_ns) / 1e6)
+                batch_open_ns = None
 
             latency_ms = (time.perf_counter() - t0) * 1000
             fps_val    = batch_size / (time.perf_counter() - prev_end) if prev_end else 0.0
@@ -121,13 +149,22 @@ class DmsfScheduler:
             prev_end  = time.perf_counter()
             pbar.update(batch_size)
 
-        # Flush remaining
+        # Flush remaining. Marked up like a full batch so the last, partial unit
+        # lands in busy_s and in the service samples the same way every other
+        # one does — the cloud counts its completion regardless.
         if buf:
+            with open(self._timing_log_edge, "a") as _tf:
+                print(str(time.time_ns()) + " get input", file=_tf)
             imgs    = torch.stack(buf).to(self.device)
             payload = model.forward_edge(imgs, split_point)
             payload['edge_start_time'] = time.time()
             msg = pickle.dumps({'action': 'FEATURES', 'data': payload})
             self.channel.basic_publish(exchange='', routing_key=INTERMEDIATE_QUEUE, body=msg)
+            out_ns = time.time_ns()
+            with open(self._timing_log_edge, "a") as _tf:
+                print(str(out_ns) + " output", file=_tf)
+            if batch_open_ns is not None:
+                self._pipeline_ms.append((out_ns - batch_open_ns) / 1e6)
 
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
@@ -137,8 +174,9 @@ class DmsfScheduler:
         pbar.close()
         print(f"[Edge] Done. {total_batches_sent} batches sent.")
 
-        # Compute utilization — will be piggybacked onto NOTIFY message
-        _util_edge = self._compute_utilization(self._timing_log_edge, 'edge')
+        # Measurement goes out on its own queue, before the control message, so
+        # it is already sitting on the broker when the server drains at shutdown.
+        self._send_utilization(self._compute_utilization(self._timing_log_edge, 'edge'))
 
         # Broadcast edge metrics CSV to all cloud clients via fanout exchange
         metrics_file = os.path.join(log_path, f"metrics_raw_{self._id_tag}.csv")
@@ -156,14 +194,13 @@ class DmsfScheduler:
             except Exception as e:
                 print(f"[Edge] Warning: could not broadcast metrics: {e}")
 
-        # Notify server — piggyback utilization stats so no extra queue needed
+        # Control message only — measurement already went out above.
         self.channel.basic_publish(
             exchange='', routing_key='rpc_queue',
             body=pickle.dumps({'action': 'NOTIFY',
                                'client_id': self.client_id,
                                'layer_id': self.layer_id,
-                               'batch_count': total_batches_sent,
-                               'utilization': _util_edge}))
+                               'batch_count': total_batches_sent}))
 
         # Wait for STOP
         reply_q = f"reply_{self.client_id}"
@@ -224,8 +261,10 @@ class DmsfScheduler:
                 if self._fps_start_t is None:
                     self._fps_start_t = time.time()
 
+                # The unit enters this stage the moment it is dequeued.
+                deq_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                    print(str(deq_ns) + " get input", file=_tf)
 
                 recv_size = len(body)
                 payload = msg['data']
@@ -253,9 +292,18 @@ class DmsfScheduler:
 
                 self._fps_times.append(cloud_end)
                 self._fps_batch_sizes.append(bs)
+                # Two machines by definition, so this inherits any offset
+                # between their clocks — report it, but treat it as indicative.
+                self._e2e_ms.append(e2e_ms)
 
+                # Exactly one stage publishes per unit, and for a head+tail
+                # split that is the tail. Two publishers would double the
+                # measured throughput. The body is an identity — the producing
+                # cluster — with no timestamp and no unit id in it.
                 self.channel.basic_publish(
-                    exchange='', routing_key='fps_queue', body=b'DONE')
+                    exchange='', routing_key='fps_queue',
+                    body=CLUSTER_ID.encode())
+                self._pipeline_ms.append((time.time_ns() - deq_ns) / 1e6)
 
                 self._write_metrics(log_path, split_point, 'cloud', batch_id, bs,
                                     latency_ms, fps_val, ram_mb, recv_size,
@@ -273,16 +321,14 @@ class DmsfScheduler:
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
 
-        # Compute utilization — piggybacked onto CLOUD_DONE
-        _util_cloud = self._compute_utilization(self._timing_log_cloud, 'cloud')
+        # Measurement first, on its own queue, then the control message.
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, 'cloud'))
 
-        # Tell server this cloud is fully done — include utilization in same message
         self.channel.basic_publish(
             exchange='', routing_key='rpc_queue',
             body=pickle.dumps({'action': 'CLOUD_DONE',
                                'client_id': self.client_id,
-                               'batches': batch_id,
-                               'utilization': _util_cloud}))
+                               'batches': batch_id}))
 
         pbar.close()
         self._pivot_and_save(log_path)
@@ -291,6 +337,14 @@ class DmsfScheduler:
     # FPS summary (fps_guide §10 — total_frames / total_time, not mean of 1/Δt)
     # ---------------------------------------------------------------------- #
     def _finish_fps(self):
+        """This cloud's own view of throughput — a local reference, not the result.
+
+        The authoritative system number is the server's: it counts every
+        arrival from every cloud against the shared START recorded when work was
+        dispatched. This one starts at *this* device's first arrival, so it
+        excludes pipeline fill-up and knows nothing about the other clouds.
+        Labelled so the two can never be confused in a console scrollback.
+        """
         t = self._fps_times
         n = len(t)
         total_frames = sum(self._fps_batch_sizes)
@@ -299,7 +353,7 @@ class DmsfScheduler:
             total_time = t[-1] - self._fps_start_t
             system_fps = total_frames / total_time
             self._fps_system = system_fps
-            print(f"  [SYSTEM FPS]      {system_fps:8.3f} fps   "
+            print(f"  [cloud-local FPS] {system_fps:8.3f} fps   "
                   f"= {total_frames} frames / {total_time:.2f}s  (first arrival -> last DONE)")
             if n >= 2 and t[-1] > t[0]:
                 span = t[-1] - t[0]
@@ -316,20 +370,31 @@ class DmsfScheduler:
                     print(f"  [ref mean, N/U]   {ref_mean:8.3f} fps   "
                           f"(arithmetic mean of 1/dt — reference only, biased high)")
         else:
-            print("  [SYSTEM FPS]      no batches received — nothing to report")
-        print(f"  batches counted: {n}")
+            print("  [cloud-local FPS] no batches received — nothing to report")
+        print(f"  batches counted: {n}   (server holds the authoritative total)")
         print("=" * 60)
 
     # ---------------------------------------------------------------------- #
     # Utilization (utilization_guide.md)
     # ---------------------------------------------------------------------- #
     def _compute_utilization(self, tlog_path, role):
+        """One ratio for the whole run, computed after it, from this device's log.
+
+        Numerator and denominator both come from this device's own clock, so
+        clock skew between machines cannot distort the ratio. The per-unit
+        intervals are summed *before* dividing, never averaged.
+
+        The same intervals are returned as `service_ms`, which is what makes
+        `Σ service == busy_s` true by construction rather than by luck (04 §2.1).
+        """
         t_start = t_end = t_input = None
         busy_ns = 0
         n_packages = 0
+        service_ms = []
         try:
             with open(tlog_path) as f:
                 for line in f:
+                    # Split ONCE: event names contain spaces ("get input").
                     parts = line.strip().split(" ", 1)
                     if len(parts) < 2 or not parts[0].isdigit():
                         continue
@@ -341,10 +406,15 @@ class DmsfScheduler:
                     elif event == 'get input':
                         t_input = ts
                     elif event == 'output':
+                        # An unmatched 'get input' — a crash mid-unit — is
+                        # dropped rather than counted as an infinite interval.
                         if t_input is not None:
                             busy_ns += ts - t_input
+                            service_ms.append((ts - t_input) / 1e6)
                             n_packages += 1
                             t_input = None
+                    # Any other event is ignored by design, so new markers can
+                    # be added without breaking this parser.
         except Exception as e:
             print(f"[Utilization][{role}] Warning: could not read log: {e}")
             return None
@@ -357,26 +427,43 @@ class DmsfScheduler:
               f"busy={busy_ns/1e9:.3f}s total={total_ns/1e9:.3f}s "
               f"utilization={util*100:.2f}%")
         return {"role": role, "packages": n_packages,
-                "busy_ns": busy_ns, "total_ns": total_ns, "utilization": util}
+                "busy_ns": busy_ns, "total_ns": total_ns, "utilization": util,
+                "service_ms": service_ms}
 
     def _send_utilization(self, stats):
+        """Ship this device's report — ratio plus raw latency arrays — at shutdown.
+
+        Goes to a dedicated queue, not the control queue: the server stops
+        reading control the moment the last edge reports done, but the clouds
+        finish later, so a report sent there would never be consumed. On its own
+        queue the report simply waits on the broker. Publisher and consumer
+        never need to be alive at the same moment.
+        """
         if stats is None:
             print(f"[Utilization] Skipped (stats=None) client={str(self.client_id)[:8]}")
             return
         try:
-            self.channel.queue_declare(queue='utilization_queue', durable=False)
+            self.channel.queue_declare(queue=UTILIZATION_QUEUE, durable=False)
             self.channel.basic_publish(
-                exchange='', routing_key='utilization_queue',
+                exchange='', routing_key=UTILIZATION_QUEUE,
                 body=pickle.dumps({
                     "action": "UTILIZATION",
                     "client_id": str(self.client_id),
                     "layer_id": self.layer_id,
+                    "cluster": CLUSTER_ID,
                     **stats,
+                    # Raw samples, never pre-reduced percentiles — the server
+                    # pools across devices before it takes any percentile.
+                    "pipeline_ms": list(self._pipeline_ms),
+                    "e2e_ms": list(self._e2e_ms),
                 }))
             print(f"[Utilization] Sent  role={stats['role']:5s}  "
                   f"client={str(self.client_id)[:8]}  "
-                  f"util={stats['utilization']*100:.2f}%")
+                  f"util={stats['utilization']*100:.2f}%  "
+                  f"samples: service={len(stats.get('service_ms') or [])} "
+                  f"pipeline={len(self._pipeline_ms)} e2e={len(self._e2e_ms)}")
         except Exception as e:
+            # Telemetry never kills the run: a broken metric loses a number.
             print(f"[Utilization] Warning: could not send: {e}")
 
     # ---------------------------------------------------------------------- #

@@ -11,6 +11,14 @@ import pika
 import torch
 import yaml
 
+# See server.py: redirected stdout gets the ANSI codepage, which cannot encode
+# the em dashes in the pinned summary format. Telemetry must not kill the run.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, OSError):
+    pass
+
 # Thêm src/ vào path để các module trong src/ tìm được nhau
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 

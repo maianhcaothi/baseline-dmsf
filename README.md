@@ -78,6 +78,44 @@ Stored in Google Drive at `DMSF_checkpoints/data/visdrone/` with `.done` flag.
 Link: https://drive.google.com/drive/u/0/folders/1yZRoQ4fGPZ3e5O2owXpRquSCV39DAZ4e
 ---
 
+## Distributed run — measurement output
+
+`server.py` + `client.py --layer_id {1,2}` run the split pipeline over RabbitMQ.
+Each run writes seven plain-text logs to `log-path`, in the portable format
+specified in `../guide/` (**cluster** naming scheme), then archives them
+alongside the `config.yaml` that produced them:
+
+```
+<log-path>/
+├── batch_done_ns.log        system throughput series      one line per completed batch
+├── fps_cluster_ns.log       per-cluster throughput series one line per completed batch
+├── fps_cluster.log          throughput summary            per cluster + SYSTEM
+├── utilization.log          per-device busy ratio         one line per device
+├── utilization_cluster.log  utilization rolled up         per cluster / role / SYSTEM
+├── latency_cluster.log      service, pipeline, e2e        pooled, nearest-rank percentiles
+├── events_ns.log            control-plane events          split-point decision
+└── results/results_<MMDD>_<HHMM>_<auto|fixed-spN>/   archived copy + config.yaml
+```
+
+What each latency kind measures — they are not interchangeable:
+
+| kind | span | clock | exact? |
+|---|---|---|---|
+| `service` | the device's own `get input → output` | one | yes |
+| `pipeline` | in-stage residency, contains `service` | one | yes |
+| `e2e` | edge start → cloud output | **two machines** | indicative |
+
+```bash
+python ../guide/validate_results.py <run-dir> --names cluster   # conformance, exits 0
+cd .. && python build_nb.py && python run_nb.py                 # renders the charts
+```
+
+Charts land in `<run-dir>/imgs/`. Detection-accuracy charts (09, 10) are not
+produced: the streaming path has no ground truth, and model accuracy is outside
+this result format's scope.
+
+---
+
 ## Key implementation notes
 
 - **Conv 2×2 spatial preservation**: `F.pad(x,(0,1,0,1))` + Conv2d(k=2,p=0) → H×W unchanged

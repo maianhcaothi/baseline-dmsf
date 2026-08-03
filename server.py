@@ -3,6 +3,16 @@ import os
 import signal
 import yaml
 
+# The console summary format is pinned verbatim by the guide and contains em
+# dashes. Piping this server's output to a file (`python server.py > run.log`)
+# hands stdout the ANSI codepage, which cannot encode them — and an encode error
+# inside the shutdown path would take the whole results pipeline with it.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, OSError):
+    pass
+
 # Thêm src/ vào path để DmsfServer.py tìm được DmsfScheduler
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
