@@ -82,7 +82,7 @@ Link: https://drive.google.com/drive/u/0/folders/1yZRoQ4fGPZ3e5O2owXpRquSCV39DAZ
 
 `server.py` + `client.py --layer_id {1,2}` run the split pipeline over RabbitMQ.
 Each run writes seven plain-text logs to `log-path`, in the portable format
-specified in `../guide/` (**cluster** naming scheme), then archives them
+specified in `guide/` (**cluster** naming scheme), then archives them
 alongside the `config.yaml` that produced them:
 
 ```
@@ -106,13 +106,28 @@ What each latency kind measures — they are not interchangeable:
 | `e2e` | edge start → cloud output | **two machines** | indicative |
 
 ```bash
-python ../guide/validate_results.py <run-dir> --names cluster   # conformance, exits 0
-cd .. && python build_nb.py && python run_nb.py                 # renders the charts
+python guide/validate_results.py <run-dir> --names cluster   # conformance, exits 0
+python build_nb.py && python run_nb.py                       # renders the charts
 ```
 
 Charts land in `<run-dir>/imgs/`. Detection-accuracy charts (09, 10) are not
 produced: the streaming path has no ground truth, and model accuracy is outside
 this result format's scope.
+
+### Optional measurements not ported
+
+`guide/` also specifies three optional measurements. Each is all-its-files or
+none (`guide/01-result-format.md` §2), so none of them is half-implemented here:
+
+| Feature | Files | Why not ported |
+|---|---|---|
+| Free time (`guide/10`) | `free_time*.log` | needs per-lane interval merging on every device; the workers here are single-threaded, so free time collapses to `1 − utilization` and would report nothing utilization does not |
+| Infra-host RAM (`guide/11`) | `broker_ram*.log` | the broker runs on loopback in this setup, so there is no separate host to sample over SSH |
+| Message size (`guide/12`) | `message_size*.log` | the payload size per publish is already recorded per batch in the per-device metrics CSV; promoting it to the result format needs the server-side "which worker measures" election |
+
+Adding any of them means porting its whole checklist block in
+`guide/09-port-checklist.md` §4b, including the feature flag living in the
+server's config and travelling in the dispatch message.
 
 ---
 

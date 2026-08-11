@@ -9,12 +9,21 @@ build silently reverts it.
 import nbformat as nbf
 from pathlib import Path
 
-OUT = Path(r"d:\SplitInference\DMSF\results\visual\DMSF Result Visualization.ipynb")
+# Anchored to this file, not to a machine. The project has already been moved
+# once (it used to sit one directory up), and a hardcoded absolute root turns
+# that into a notebook that builds into a directory nobody reads.
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "results" / "visual" / "DMSF Result Visualization.ipynb"
 
 nb = nbf.v4.new_notebook()
 cells = []
 md = lambda s: cells.append(nbf.v4.new_markdown_cell(s.strip("\n")))
-code = lambda s: cells.append(nbf.v4.new_code_cell(s.strip("\n")))
+# The generated notebook still wants ONE absolute ROOT constant (guide 08 §9) —
+# it is executed with its own directory as cwd, so a relative path there would
+# mean something different from here. The builder knows the absolute path, so it
+# stamps it in rather than making the notebook guess.
+code = lambda s: cells.append(
+    nbf.v4.new_code_cell(s.strip("\n").replace("__PROJECT_ROOT__", str(HERE))))
 
 
 # ---------------------------------------------------------------------------- #
@@ -58,7 +67,7 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-ROOT    = Path(r"d:\SplitInference\DMSF")
+ROOT    = Path(r"__PROJECT_ROOT__")   # stamped in by build_nb.py
 RESULTS = ROOT / "results"
 
 # Newest directory that actually holds a run. Set RUN_DIR by hand to pin one.

@@ -14,6 +14,78 @@ The DMSF paper PDF is at `DMSF_A_Dynamic_Model_Splitting_Framework_for_Edge-Clou
 - **cls_gain = 0.5** in `loss.py` — this is intentional (paper-correct), NOT `0.5 * nc/80`
 - **Conv 2×2** in `compress_recover.py` is intentional — matches paper Section III-B
 - Both DMSF variants share the same `ComputeLoss` and `evaluate()` — do not diverge them
+- The distributed run writes a **fixed result format** (see below). Do not change
+  a filename, a key name, or a number format in `src/DmsfResults.py` without
+  re-reading `guide/01-result-format.md` — the notebook and the validator both
+  depend on it
+
+---
+
+## Result format (distributed run)
+
+`guide/` is the normative spec. This project uses the **cluster** naming
+scheme; never mix in the `group_*` names. Seven files, all truncated at server
+startup, all written to `config['log-path']`:
+
+| File | Written | Granularity |
+|---|---|---|
+| `batch_done_ns.log` | live | one line per completed unit (1 col during warm-up, 2 after) |
+| `fps_cluster_ns.log` | live | same arrivals, bucketed by cluster |
+| `fps_cluster.log` | shutdown | one line per cluster + `SYSTEM` |
+| `utilization.log` | shutdown | one line per device |
+| `utilization_cluster.log` | shutdown | `ALL`, cluster×role, `SYSTEM` |
+| `latency_cluster.log` | shutdown | pooled service / pipeline / e2e |
+| `events_ns.log` | live | one line per control decision |
+
+### Invariants that are easy to break
+
+- **One clock.** Every timestamp in these files is `time.time_ns()` on the
+  server. Device timestamps only ever appear as durations computed inside one
+  device (`busy_s`, `total_s`, the latency samples).
+- **Exactly one stage publishes per unit.** The cloud (tail) publishes to
+  `fps_queue`; the edge does not. Two publishers double the measured throughput.
+- **The DONE body is an identity**, `CLUSTER_ID`, never a timestamp. The server
+  reads it only to bucket the arrival.
+- **Σ service samples == `busy_s`.** Both come from the same `get input →
+  output` intervals in the device timing log, which is why
+  `_compute_utilization` returns the samples rather than recomputing them.
+- **`pipeline` ⊇ `service`.** `pipeline` is in-stage residency: on the edge it
+  starts when the batch's first frame is read, on the cloud when the message is
+  dequeued. The gap is buffering.
+- **Measurement rides `utilization_queue`, not `rpc_queue`.** The server stops
+  reading control the moment the last edge reports; the clouds finish later.
+- **Console summary format is pinned** by `guide/02-throughput.md` §7 — do not
+  reflow those f-strings, the whitespace is the format. They contain em dashes,
+  which is why the entrypoints reconfigure stdout to UTF-8.
+- **`W = 16`** for the rolling window. Charts assume it.
+- **Truncation and scratch purge are both central**, in `DmsfServer.__init__`.
+  `truncate_all` empties the seven logs; `purge_scratch` deletes
+  `metrics_pivot.lock` and `metrics_raw_*.csv`, which are write-once leftovers
+  that otherwise win over the current run forever (guide 05 §5).
+- **The shutdown hard cap is absolute.** `fps.shutdown_timeout_s` is measured
+  from the STOP broadcast and never extended — an earlier version added 60 s
+  whenever a cloud was still missing, which never terminates if that cloud is
+  dead. A merely slow cloud finishes through `CLOUD_DONE` long before the cap.
+
+### Optional measurements deliberately not ported
+
+Free time (guide 10), infra-host RAM (guide 11) and message size (guide 12) are
+**not** implemented, and each is all-its-files-or-none. Do not add one file of a
+feature. The reasons are in `README.md`; porting one means working the whole
+§4b block of `guide/09-port-checklist.md`, feature flag included.
+
+### Verifying a run
+
+```bash
+python guide/validate_results.py <run-dir> --names cluster   # must exit 0
+python build_nb.py && python run_nb.py                       # must report 0 cell errors
+```
+
+`results/synthetic-selftest/` is an invented fixture that exercises the whole
+path without a broker; it is labelled and must never be quoted as a result.
+`build_nb.py` / `run_nb.py` anchor every path to `Path(__file__).parent`, and
+`build_nb.py` stamps that absolute root into the notebook's setup cell — do not
+reintroduce a hardcoded root, the project has already been moved once.
 
 ---
 
@@ -99,6 +171,8 @@ Stored in `MyDrive/DMSF_checkpoints/`.
 | Cell 5 goes to `else` branch | `.done` flag not found or Drive shortcut delay | Wait for Drive sync; shortcut needs to be added to My Drive |
 | Old code runs despite new zip upload | Cell 4 skips extraction if folder exists | `shutil.rmtree('/content/baseline_DMSF')` then re-run Cell 4 |
 | `ModuleNotFoundError: ultralytics` | Cell 3 not re-run after adding ultralytics | Re-run Cell 3 |
+| No `metrics_pivoted_dmsf.csv` after a run | A crashed previous run left `metrics_pivot.lock` behind, so `_pivot_and_save` returns early | The server now purges it at startup (`R.purge_scratch`). If it recurs, the server did not start this run — delete `<log-path>/metrics_pivot.lock` by hand. Never affected the seven result logs, which are truncated unconditionally |
+| Server never exits after the run | a cloud died before sending `CLOUD_DONE` | it now stops at `fps.shutdown_timeout_s` (default 300 s) and prints the partial count in the stop reason. Raise the key for a genuinely long drain — do not reintroduce an extending cap |
 
 ---
 

@@ -28,6 +28,7 @@ a broker.
 """
 
 import datetime
+import glob
 import math
 import os
 import shutil
@@ -49,6 +50,16 @@ RESULT_FILES = (
     "events_ns.log",
 )
 
+# Scratch, not results (05 §5). These are per-device working files and a
+# write-once lock; none of them belongs in an archive, and every one of them
+# silently wins over the current run if a previous run left it behind.
+SCRATCH_GLOBS = (
+    "metrics_pivot.lock",      # a crashed run leaves it; _pivot_and_save then
+                               # returns early forever and no pivot is written
+    "metrics_raw_*.csv",       # per-device rows; leftovers get folded into the
+                               # next run's pivot as if they were this run's
+)
+
 
 # ---------------------------------------------------------------------------- #
 # Lifecycle
@@ -63,6 +74,33 @@ def truncate_all(log_path):
     os.makedirs(log_path, exist_ok=True)
     for name in RESULT_FILES:
         open(os.path.join(log_path, name), "w").close()
+
+
+def purge_scratch(log_path):
+    """Delete last run's scratch files, once, centrally, at startup — 05 §5.
+
+    A write-once artifact that is never cleared "wins" forever: the pivot lock
+    left behind by a crashed run makes every later run skip its own pivot, and
+    leftover per-device CSVs get merged into the next run's summary as though
+    they belonged to it. The numbers stay plausible, which is what makes this
+    worth deleting rather than detecting.
+
+    Centrally, in the component that starts **once** — doing it per worker lets
+    a late starter delete files an earlier worker is already writing.
+
+    Returns the number of files removed. Failure is never fatal.
+    """
+    removed = 0
+    for pattern in SCRATCH_GLOBS:
+        for path in glob.glob(os.path.join(log_path, pattern)):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as e:
+                print(f"[Startup] Warning: could not remove {path}: {e}")
+    if removed:
+        print(f"[Startup] Cleared {removed} leftover scratch file(s) from a previous run")
+    return removed
 
 
 # ---------------------------------------------------------------------------- #

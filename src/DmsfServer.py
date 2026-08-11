@@ -56,7 +56,12 @@ class DmsfServer:
         self._fps_stop_t = None
         self._last_done_t = None
         self._count_cloud_done = 0
-        self._fps_hardcap_s = 300.0
+        # 02 §9. grace_s is how long to keep collecting once nothing is left to
+        # arrive; shutdown_timeout_s is the absolute cap from the stop broadcast,
+        # and it only ever fires on failure — on a healthy run grace wins first.
+        fps_cfg = config.get('fps') or {}
+        self._fps_grace_s   = float(fps_cfg.get('grace_s', 10.0))
+        self._fps_hardcap_s = float(fps_cfg.get('shutdown_timeout_s', 300.0))
         self._util_records = []       # drained from UTILIZATION_QUEUE at shutdown
 
         self.log_path = config.get('log-path', '.')
@@ -72,6 +77,10 @@ class DmsfServer:
         # per-worker instead lets a late starter wipe a file another worker is
         # already appending to.
         R.truncate_all(self.log_path)
+        # Scratch from a previous run is cleared on the same terms (05 §5): a
+        # leftover metrics_pivot.lock makes every later run skip its pivot, and
+        # leftover metrics_raw_*.csv rows get merged into this run's summary.
+        R.purge_scratch(self.log_path)
 
         self.register_clients = [0] * len(self.total_clients)
         self.list_clients = []
@@ -144,7 +153,10 @@ class DmsfServer:
                 self.notify_clients(start=False)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 self._fps_stop_t = time.time()
-                self.connection.call_later(10.0, self._fps_drain_check)
+                # NOTE: no stop_consuming() here. The clouds are still draining
+                # their backlog, and every completion they publish from now on
+                # is one this run would otherwise undercount.
+                self.connection.call_later(1.0, self._fps_drain_check)
                 return
 
         elif action == 'CLOUD_DONE':
@@ -155,9 +167,12 @@ class DmsfServer:
             print(f"[Server] CLOUD_DONE {self._count_cloud_done}/{n_cloud}  "
                   f"client={str(msg.get('client_id',''))[:8]}  batches={batches}")
             if self._count_cloud_done >= n_cloud:
-                # All clouds finished — wait 2s for any in-flight DONEs then stop
-                self.connection.call_later(2.0,
-                    lambda: self._finish_fps_and_stop("all clouds done"))
+                # Every cloud has published everything it will publish. Grace
+                # covers the DONEs still in flight on the broker between their
+                # last publish and this control message.
+                self.connection.call_later(
+                    self._fps_grace_s,
+                    lambda: self._finish_fps_and_stop("all clouds done + grace"))
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -250,21 +265,40 @@ class DmsfServer:
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _fps_drain_check(self):
-        # Safety hardcap only — primary stop is via CLOUD_DONE
+        """Drain-watch: keep collecting past first-stage shutdown — 02 §5.3.
+
+        The primary stop is the CLOUD_DONE path; this is the safety net for the
+        case where a cloud never reports at all.
+
+        The hard cap is **absolute**, measured from the stop broadcast. An
+        earlier version extended it by 60 s whenever a cloud was still missing,
+        which is unbounded: a cloud that has died is missing forever, so the
+        server never exited and never wrote its summary. A cloud that is merely
+        slow is not the case this cap is for — it is still publishing, so it
+        finishes through CLOUD_DONE long before the cap, and a run that needs
+        longer than the cap says so in ``fps.shutdown_timeout_s`` (02 §9).
+        """
         if self._fps_printed:
             return
-        elapsed = time.time() - self._fps_stop_t if self._fps_stop_t else 0
+        now = time.time()
         n_cloud = self.total_clients[1]
+        elapsed = now - self._fps_stop_t if self._fps_stop_t else 0.0
+
         if elapsed >= self._fps_hardcap_s:
-            if self._count_cloud_done < n_cloud:
-                # Clouds still running — extend deadline by 60s and keep waiting
-                print(f"[Server] Hardcap {self._fps_hardcap_s:.0f}s reached but only "
-                      f"{self._count_cloud_done}/{n_cloud} CLOUD_DONE — extending 60s ...")
-                self._fps_stop_t = time.time() - (self._fps_hardcap_s - 60)
-            else:
-                self._finish_fps_and_stop(f"hard cap {self._fps_hardcap_s:.0f}s reached")
-                return
-        self.connection.call_later(10.0, self._fps_drain_check)
+            self._finish_fps_and_stop(
+                f"hard cap {self._fps_hardcap_s:.0f}s reached with "
+                f"{self._count_cloud_done}/{n_cloud} CLOUD_DONE")
+            return
+
+        # Nothing has arrived for a whole grace window and every cloud has
+        # reported: the backlog is drained and the in-flight unit has landed.
+        last = self._last_done_t or self._fps_stop_t
+        if (self._count_cloud_done >= n_cloud
+                and last is not None and (now - last) >= self._fps_grace_s):
+            self._finish_fps_and_stop("work drained + grace")
+            return
+
+        self.connection.call_later(1.0, self._fps_drain_check)
 
     def _finish_fps_and_stop(self, reason="grace elapsed"):
         if self._fps_printed:
