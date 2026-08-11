@@ -29,4 +29,8 @@ python guide/validate_results.py <real-run-dir> --names cluster
 python build_nb.py && python run_nb.py
 ```
 
-Regenerate this fixture with the harness in the scratchpad (`make_fixture.py`).
+Regenerate this fixture in place with the harness that sits beside it:
+
+```bash
+python results/synthetic-selftest/make_fixture.py
+```

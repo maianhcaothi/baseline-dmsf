@@ -81,6 +81,16 @@ Link: https://drive.google.com/drive/u/0/folders/1yZRoQ4fGPZ3e5O2owXpRquSCV39DAZ
 ## Distributed run — measurement output
 
 `server.py` + `client.py --layer_id {1,2}` run the split pipeline over RabbitMQ.
+`--layer_id` is the only required flag: the device's own name and compute device
+come from `setup.json` next to `config.yaml` (machine-specific, gitignored),
+
+```json
+{ "name": "machine-2", "device": "cpu" }
+```
+
+`--name` / `--device` still override it, which is how `run_cluster.ps1` gives each
+of its 12 processes a distinct name from one host file.
+
 Each run writes seven plain-text logs to `log-path`, in the portable format
 specified in `guide/` (**cluster** naming scheme), then archives them
 alongside the `config.yaml` that produced them:

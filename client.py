@@ -27,10 +27,22 @@ from src.DmsfRpcClient import DmsfRpcClient
 
 parser = argparse.ArgumentParser(description='DMSF Baseline Client')
 parser.add_argument('--layer_id', type=int, required=True, help='1=edge, 2=cloud')
-parser.add_argument('--device',   type=str, default=None)
+parser.add_argument('--device',   type=str, default=None,
+                    help='cpu | cuda — mặc định lấy từ setup.json, rồi auto-detect')
 parser.add_argument('--name',     type=str, default=None,
-                    help='Tên thiết bị — dùng để tra profile trong unified profile format')
+                    help='Tên thiết bị — mặc định lấy từ setup.json; dùng để tra profile '
+                         'trong unified profile format')
 args = parser.parse_args()
+
+# setup.json is this host's identity — the two values that used to be retyped on
+# every launch. Machine-specific and gitignored, like config.yaml. A flag still
+# wins: run_cluster.ps1 runs the whole fleet from one copy of this file, and
+# --name has to stay unique per process.
+_setup_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'setup.json')
+setup = {}
+if os.path.exists(_setup_file):
+    with open(_setup_file) as f:
+        setup = json.load(f)
 
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -39,8 +51,10 @@ rabbit   = config['rabbit']
 dmsf_cfg = config.get('dmsf', config.get('server', {}))
 client_id = uuid.uuid4()
 
-device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"[Client] layer_id={args.layer_id}  device={device}  id={str(client_id)[:8]}")
+name   = args.name   or setup.get('name')
+device = args.device or setup.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"[Client] layer_id={args.layer_id}  name={name}  device={device}  "
+      f"id={str(client_id)[:8]}")
 
 credentials = pika.PlainCredentials(rabbit.get('username', 'guest'),
                                     rabbit.get('password', 'guest'))
@@ -90,20 +104,21 @@ if sp_cfg == 'auto':
 
         if 'devices' in prof:
             # Unified format: {"devices": {"machine-2": {"edge_times_ms": ..., ...}}}
-            name = args.name
-            if not name:
-                print("[Client] WARNING: unified profile requires --name. Using first entry.")
-                name = next(iter(prof['devices']))
-            device_prof = prof['devices'].get(name)
+            prof_name = name
+            if not prof_name:
+                print("[Client] WARNING: unified profile requires a name "
+                      "(setup.json or --name). Using first entry.")
+                prof_name = next(iter(prof['devices']))
+            device_prof = prof['devices'].get(prof_name)
             if device_prof is None:
-                raise KeyError(f"Device '{name}' not found in profile. "
+                raise KeyError(f"Device '{prof_name}' not found in profile. "
                                f"Available: {list(prof['devices'].keys())}")
             if args.layer_id == 1:
                 edge_times_ms = {int(k): v for k, v in device_prof['edge_times_ms'].items()}
-                print(f"[Client] Loaded edge profile: {name} from {profile_file}")
+                print(f"[Client] Loaded edge profile: {prof_name} from {profile_file}")
             else:
                 cloud_times_ms = {int(k): v for k, v in device_prof['cloud_times_ms'].items()}
-                print(f"[Client] Loaded cloud profile: {name} from {profile_file}")
+                print(f"[Client] Loaded cloud profile: {prof_name} from {profile_file}")
         else:
             # Legacy format: {"edge_times_ms": ..., "cloud_times_ms": ...}
             if args.layer_id == 1:
@@ -152,13 +167,13 @@ if __name__ == '__main__':
         'client_id':       client_id,
         'layer_id':        args.layer_id,
         'message':         'Hello from DMSF client',
-        'client_name':     args.name,
+        'client_name':     name,
         'device':          device,
         'edge_times_ms':   edge_times_ms,
         'cloud_times_ms':  cloud_times_ms,
         'bandwidth_mb_s':  bandwidth_mb_s,
     }
-    scheduler = DmsfScheduler(client_id, args.layer_id, channel, device, config, name=args.name)
+    scheduler = DmsfScheduler(client_id, args.layer_id, channel, device, config, name=name)
     client    = DmsfRpcClient(client_id, args.layer_id, channel,
                               scheduler.inference_func, device)
     client.send_to_server(data)

@@ -15,8 +15,12 @@ import sys
 import types
 from pathlib import Path
 
-BASE = Path(r"d:\SplitInference\DMSF\baseline-dmsf")
-OUT = Path(r"d:\SplitInference\DMSF\results\synthetic-selftest")
+# Anchored to this file, never to a machine — same rule as build_nb.py. The
+# project has already been moved once, and a hardcoded root survives that move
+# silently: mkdir(parents=True) happily creates the stale path, so the fixture
+# regenerates into a directory nothing reads while the real one goes stale.
+OUT = Path(__file__).resolve().parent          # this script lives IN the fixture
+BASE = OUT.parents[1]                          # results/synthetic-selftest -> repo root
 
 # ---- stub the deps this box does not have; none are used on the paths we call
 class _Any(types.ModuleType):

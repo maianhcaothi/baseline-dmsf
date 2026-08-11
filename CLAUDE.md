@@ -18,6 +18,11 @@ The DMSF paper PDF is at `DMSF_A_Dynamic_Model_Splitting_Framework_for_Edge-Clou
   a filename, a key name, or a number format in `src/DmsfResults.py` without
   re-reading `guide/01-result-format.md` — the notebook and the validator both
   depend on it
+- **`setup.json` is per-host identity**, gitignored like `config.yaml`: `name` and
+  `device` for a client launched as bare `python client.py --layer_id 1`.
+  Resolution order is flag → `setup.json` → auto-detect, and it must stay that
+  way — `run_cluster.ps1` runs the whole fleet from one host file and relies on
+  `--name` winning, since `_id_tag` must be unique per process
 
 ---
 
