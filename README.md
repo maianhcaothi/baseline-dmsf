@@ -91,6 +91,38 @@ come from `setup.json` next to `config.yaml` (machine-specific, gitignored),
 `--name` / `--device` still override it, which is how `run_cluster.ps1` gives each
 of its 12 processes a distinct name from one host file.
 
+### Updating the fleet
+
+`deploy.ps1` fast-forwards every host in the fleet over SSH. Copy
+`hosts.example.json` to `hosts.json` and fill in the ssh target, logical name
+and repo path per host — `hosts.json` names your machines, so it is gitignored
+like `config.yaml` and `setup.json`.
+
+```powershell
+.\deploy.ps1 -DryRun                     # report only, changes nothing
+.\deploy.ps1                             # fetch + merge --ff-only everywhere
+.\deploy.ps1 -Only machine-4,device-2    # a subset
+.\deploy.ps1 -Ref v1.2                   # pin a tag or SHA
+```
+
+It updates by **pull, never by copy**. `config.yaml` and `setup.json` are
+per-host and gitignored, and git cannot modify an ignored file — so the code
+moves and each host's identity stays put. A file copy would overwrite both, every
+host would come up under the same `name`, and since `_id_tag` is derived from it
+the hosts' `timing_*.log` and `metrics_raw_*.csv` would overwrite each other.
+
+`--ff-only` is deliberate: a host that has diverged **fails** rather than being
+merged into a state nobody has tested. One unreachable host never stops the
+fleet — every host is attempted and the closing table is the report, which also
+warns when the fleet ends up on more than one commit. Runs from a mixed fleet are
+not comparable.
+
+Execution policy on this machine is `AllSigned`, so both `.ps1` scripts need:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy.ps1 -DryRun
+```
+
 Each run writes seven plain-text logs to `log-path`, in the portable format
 specified in `guide/` (**cluster** naming scheme), then archives them
 alongside the `config.yaml` that produced them:

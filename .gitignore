@@ -21,3 +21,14 @@ utilization.md
 # Machine-specific
 config.yaml
 setup.json
+# fleet inventory for deploy.ps1 — names your machines.
+# NB: gitignore has no trailing comments; a comment after a pattern becomes
+# part of the pattern and the rule silently never matches.
+hosts.json
+
+# deploy.ps1 must never be able to overwrite the three files above: they are
+# what makes each host itself. git cannot touch an ignored file, which is the
+# whole reason the fleet updates by pull and not by copy.
+
+# Client stdout/stderr from run_cluster.ps1
+client-logs/

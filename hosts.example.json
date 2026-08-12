@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Fleet inventory for deploy.ps1. Copy to hosts.json and fill in.",
+    "hosts.json is machine-specific and gitignored, exactly like config.yaml",
+    "and setup.json — it names YOUR machines, so it never belongs in the repo.",
+    "",
+    "  ssh   the target as OpenSSH takes it: user@host, or user@host:port",
+    "  name  the logical device name this host runs as. MUST match that host's",
+    "        setup.json 'name' and MUST be a key in the profile cache named by",
+    "        config.yaml dmsf.profile-cache, or 'split-point: auto' cannot",
+    "        resolve a profile for it.",
+    "  repo  absolute path to the baseline-dmsf clone on that host",
+    "  role  edge | cloud | server — reporting only; deploy treats them alike"
+  ],
+  "hosts": [
+    { "ssh": "user@192.168.101.10",      "name": "server",     "role": "server", "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+
+    { "ssh": "user@192.168.101.11",      "name": "machine-2",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.12",      "name": "machine-3",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.13",      "name": "machine-4",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.14",      "name": "machine-5",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.15",      "name": "machine-6",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.16",      "name": "machine-7",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.17",      "name": "machine-8",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.18",      "name": "machine-9",  "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.19",      "name": "machine-10", "role": "edge",   "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+
+    { "ssh": "user@100.106.160.24:2222", "name": "device-1",   "role": "cloud",  "repo": "/home/user/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.21",      "name": "device-2",   "role": "cloud",  "repo": "d:/SplitInference/DMSF/baseline-dmsf" },
+    { "ssh": "user@192.168.101.22",      "name": "device-3",   "role": "cloud",  "repo": "d:/SplitInference/DMSF/baseline-dmsf" }
+  ]
+}
