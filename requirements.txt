@@ -5,3 +5,8 @@ numpy>=1.24.0
 scipy>=1.10.0
 tqdm>=4.65.0
 pyyaml>=6.0
+
+# Distributed run. Both are imported on every host, so leaving them out made a
+# fresh install fail at the first launch rather than at install time.
+pika>=1.3.0        # broker client: server.py, client.py, src/DmsfUtils.py
+psutil>=5.9.0      # per-batch RSS in src/DmsfScheduler.py
