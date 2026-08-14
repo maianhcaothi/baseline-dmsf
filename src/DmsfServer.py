@@ -382,7 +382,13 @@ class DmsfServer:
 
     def _collect_utilization(self):
         import datetime
-        records = self._drain_utilization_reports()
+        try:
+            records = self._drain_utilization_reports()
+        except Exception as e:
+            # A broker error here used to propagate out of start() and take the
+            # archive with it, so a hiccup on the last drain cost the whole run.
+            print(f"[Utilization] Warning: could not drain reports: {e}")
+            records = []
         if not records:
             print("[Utilization] WARNING: no device reports — utilization and "
                   "latency logs left empty")
@@ -574,15 +580,56 @@ class DmsfServer:
         except Exception as e:
             print(f"[Archive] Warning: could not archive run: {e}")
 
+    def request_stop(self, reason="interrupted"):
+        """End the consume loop from outside it — the Ctrl+C handler's entry
+        point. Prints the same summary a self-terminating run prints, so an
+        interrupted run is still a readable one."""
+        try:
+            self._finish_fps_and_stop(reason)
+        except Exception as e:
+            print(f"[Server] Warning: could not stop cleanly ({e}); "
+                  f"forcing the consume loop to end")
+            try:
+                self.channel.stop_consuming()
+            except Exception:
+                pass
+
     def start(self):
         # stop_consuming() fires in the finalizer, not at first-stage shutdown —
         # that is what actually ends the loop, and leaving it out until then is
         # what lets late completions from the slower tier still be counted.
-        self.channel.start_consuming()
+        try:
+            self.channel.start_consuming()
+        except KeyboardInterrupt:
+            # Reached only if the signal lands somewhere the handler cannot
+            # convert into a clean stop. The results are still worth writing.
+            print("\n[Server] Interrupted — writing what this run produced.")
+        finally:
+            self._finalize()
+        sys.exit(0)
+
+    def _finalize(self):
+        """Every shutdown writer, once, whatever ended the run.
+
+        In a `finally`, and each step independently guarded, because these were
+        four bare statements after start_consuming(): anything that ended the
+        loop other than a clean return — Ctrl+C, a broker error during the
+        drain — skipped all of them, and the archive silently never happened.
+        The archive runs last and unconditionally, so a run that produced only
+        a partial set of logs still keeps that partial set.
+        """
+        if getattr(self, '_finalized', False):
+            return
+        self._finalized = True
         # Shutdown order per 01 §4: throughput summary, then the device reports
         # and everything rolled up from them, then the archive.
-        self._write_rate_summary()
-        self._collect_utilization()
-        self._archive_run()
-        self.connection.close()
-        sys.exit(0)
+        for step in (self._write_rate_summary, self._collect_utilization,
+                     self._archive_run):
+            try:
+                step()
+            except Exception as e:
+                print(f"[Shutdown] Warning: {step.__name__} failed: {e}")
+        try:
+            self.connection.close()
+        except Exception:
+            pass
