@@ -12,6 +12,9 @@ __pycache__/
 *.ipynb
 
 # Runtime outputs
+# mAP ground truth + write-once predictions (regenerate: make_map_labels.py).
+# NB: the comment is on its own line on purpose — see the note below.
+map/
 *.log
 *.npy
 *.csv

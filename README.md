@@ -123,21 +123,35 @@ Execution policy on this machine is `AllSigned`, so both `.ps1` scripts need:
 powershell -ExecutionPolicy Bypass -File deploy.ps1 -DryRun
 ```
 
-Each run writes seven plain-text logs to `log-path`, in the portable format
-specified in `guide/` (**cluster** naming scheme), then archives them
-alongside the `config.yaml` that produced them:
+Each run writes **all fourteen** result logs to `log-path`, in the portable
+format specified in `guide/` (**cluster** naming scheme), plus this project's own
+two accuracy logs, then archives them alongside the `config.yaml` that produced
+them:
 
 ```
 <log-path>/
-├── batch_done_ns.log        system throughput series      one line per completed batch
-├── fps_cluster_ns.log       per-cluster throughput series one line per completed batch
-├── fps_cluster.log          throughput summary            per cluster + SYSTEM
-├── utilization.log          per-device busy ratio         one line per device
-├── utilization_cluster.log  utilization rolled up         per cluster / role / SYSTEM
-├── latency_cluster.log      service, pipeline, e2e        pooled, nearest-rank percentiles
-├── events_ns.log            control-plane events          split-point decision
+├── batch_done_ns.log        system throughput series      one line per completed batch   required
+├── fps_cluster_ns.log       per-cluster throughput series one line per completed batch   required
+├── fps_cluster.log          throughput summary            per cluster + SYSTEM           required
+├── utilization.log          per-device busy ratio         one line per device            required
+├── utilization_cluster.log  utilization rolled up         per cluster / role / SYSTEM    required
+├── latency_cluster.log      service, pipeline, e2e        pooled, nearest-rank pcts      required
+├── cut_change_ns.log        control-plane events          split-point decision           optional
+├── free_time.log            per-device idle time          one line per device            optional ┐
+├── free_time_cluster.log    idle rolled up, and why       cluster/role/MACHINE/SYSTEM    optional ├ 10
+├── free_time_series.log     when each device was idle     one device x time bucket       optional ┘
+├── broker_ram_ns.log        queue-host RAM over the run   one sample                     optional ┐ 11
+├── broker_ram.log           what the run cost that host   BROKER/USED/DELTA/PHASE        optional ┘
+├── message_size.log         bytes one edge puts on wire   one measured worker            optional ┐ 12
+├── message_size_series.log  payload size over the run     one published message          optional ┘
+├── map.log                  accuracy, both pipelines      2 per cluster + 2 OVERALL      NOT a result file
+├── map_window.log           accuracy over the run         one sliding window             NOT a result file
 └── results/results_<MMDD>_<HHMM>_<auto|fixed-spN>/   archived copy + config.yaml
 ```
+
+The last two are **outside the portable contract** (`guide/00-file-inventory.md`
+§7): nothing in the fourteen depends on ground truth. They are archived
+alongside, and they must never stand in for a missing result file.
 
 What each latency kind measures — they are not interchangeable:
 
@@ -148,28 +162,60 @@ What each latency kind measures — they are not interchangeable:
 | `e2e` | edge start → cloud output | **two machines** | indicative |
 
 ```bash
-python guide/validate_results.py <run-dir> --names cluster   # conformance, exits 0
+python guide/validate_results.py <run-dir> --names cluster   # 14/14, 6/6, exits 0
 python build_nb.py && python run_nb.py                       # renders the charts
 ```
 
-Charts land in `<run-dir>/imgs/`. Detection-accuracy charts (09, 10) are not
-produced: the streaming path has no ground truth, and model accuracy is outside
-this result format's scope.
+Charts land in `<run-dir>/imgs/`. The notebook covers the six required files and
+the control events; the four optional features are written and validated but not
+yet charted (`guide/07` catalogues no charts for them either). `run_nb.py` needs
+`nbformat` and `nbclient`, which are not in `requirements.txt`.
 
-### Optional measurements not ported
+### The optional measurements, and what each one says here
 
-`guide/` also specifies three optional measurements. Each is all-its-files or
-none (`guide/01-result-format.md` §2), so none of them is half-implemented here:
+Every flag lives in `config.yaml` **on the server** and travels to the workers in
+the dispatch message; no client reads one from its own config file, and turning
+one off also skips the server's collector for it. Each feature is all its files
+or none.
 
-| Feature | Files | Why not ported |
+| Feature | Flag | What it adds on this project |
 |---|---|---|
-| Free time (`guide/10`) | `free_time*.log` | needs per-lane interval merging on every device; the workers here are single-threaded, so free time collapses to `1 − utilization` and would report nothing utilization does not |
-| Infra-host RAM (`guide/11`) | `broker_ram*.log` | the broker runs on loopback in this setup, so there is no separate host to sample over SSH |
-| Message size (`guide/12`) | `message_size*.log` | the payload size per publish is already recorded per batch in the per-device metrics CSV; promoting it to the result format needs the server-side "which worker measures" election |
+| Control events (`guide/01` §3.7) | — | the split-point decision, timestamped before it is broadcast |
+| Free time (`guide/10`) | `free_time.enable` | **not** `1 − utilization`: the edge decodes and resizes a whole batch *before* `get input`, so that work is invisible to utilization and busy here; the cloud's empty-queue polls become `FREE reason=input`. `busy_s` is a union of lanes, so it stays correct if a worker is ever threaded |
+| Queue-host RAM (`guide/11`) | `broker_ram.enable` | the broker is on loopback here, so the SSH premise (a host we run no code on) does not hold and the management API is used instead — every line says `source=rabbitmq_api`, where `used_mb` is the **broker process** and `total_mb` its high-water limit, the level at which publishers get blocked. Point `broker_ram.host/user/password` at a remote broker and the SSH path gives real host memory |
+| Message size (`guide/12`) | `message_size.enable` | the size of one intermediate feature map, recorded *before* each publish by exactly one edge that the **server** elects (first to register) |
 
-Adding any of them means porting its whole checklist block in
-`guide/09-port-checklist.md` §4b, including the feature flag living in the
-server's config and travelling in the dispatch message.
+### Accuracy — `map.log`, and the ground truth it needs
+
+`map.enable` turns on the whole accuracy path. Each cloud writes its
+low-threshold detections **write-once** to
+`map/pred/<cluster>/frame_NNNNNN.txt` (`class cx cy w h conf`, normalised to
+`imgsz`), ships them at shutdown, and the server scores them against
+`map/label/frame_NNNNNN.txt` with two independent pipelines: a 16-batch sliding
+window (step 1) into `map_window.log`, and one score over every matched frame
+into `map.log`. Frame numbers come from the **edge's** batch id, which travels in
+the message — several edges replaying the same video hit the same frame, and
+write-once means the first one wins rather than the last.
+
+The video has no labels, so make the reference first:
+
+```bash
+python make_map_labels.py            # whole video, split 10, conf 0.25
+```
+
+That writes **pseudo** ground truth: the same model at the deepest cut. `map.log`
+therefore reads as *agreement with the deepest-cut reference*, not as VisDrone
+accuracy — quote it that way, or drop real labels into `map/label/` in the same
+layout and every number becomes a real mAP with no code change.
+
+> **Never measure accuracy and throughput in the same run.** The prediction pass
+> and the per-frame file write sit inside `get input → output`, so they land in
+> `busy_s`, `service`, `pipeline` and `e2e`. Runs with `map.enable: true` are not
+> comparable with runs without it — measured on this fleet: SYSTEM fps −16%,
+> cloud `busy_s` +21%, `e2e` mean +22%, of which **5.96 ms per unit** is the
+> accuracy work itself (`KIND kind=map` in `free_time_cluster.log`). An accuracy
+> run is the only kind carrying `map.log`, which is how you tell two archives
+> apart in a listing. Full numbers: `PORT-NOTES.md` §4.
 
 ---
 

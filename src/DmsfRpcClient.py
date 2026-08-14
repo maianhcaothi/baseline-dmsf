@@ -42,6 +42,10 @@ class DmsfRpcClient:
             iou         = msg['iou']
             log_path    = msg.get('log_path', '.')
             num_layers  = msg['num_layers']
+            # The run's measurement settings, decided by the server and carried
+            # here. This client reads none of them from its own config file.
+            measure     = msg.get('measure') or {}
+            imgsz       = msg.get('imgsz', 640)
 
             dev = torch.device(
                 msg['device_edge'] if self.layer_id == 1 else msg['device_cloud'])
@@ -63,6 +67,8 @@ class DmsfRpcClient:
                 iou=iou,
                 log_path=log_path,
                 num_layers=num_layers,
+                measure=measure,
+                imgsz=imgsz,
             )
             return False
 

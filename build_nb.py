@@ -47,7 +47,7 @@ edit.
 | `utilization.log` | 08 |
 | `utilization_cluster.log` | 07 |
 | `latency_cluster.log` | 05, 06, 11 |
-| `events_ns.log` | overlaid on 02 |
+| `cut_change_ns.log` | overlaid on 02 |
 
 **Not produced: 09 / 10 (detection accuracy).** Model-accuracy metrics are out of
 scope for this result format, and the streaming path has no ground truth — the
@@ -267,7 +267,7 @@ def parse_util_device(path):                      # utilization.log
                          utilization=num(kv.get("utilization"))))
     return rows
 
-def parse_events(path):                           # events_ns.log
+def parse_events(path):                           # cut_change_ns.log
     rows = []
     for ln in read_lines(path):
         parts = ln.split(None, 1)                 # split ONCE: descriptions have spaces
@@ -300,7 +300,7 @@ df_batch  = pd.DataFrame(parse_batch_done(RUN_DIR / "batch_done_ns.log"),      c
 df_lat    = pd.DataFrame(parse_latency(RUN_DIR / "latency_cluster.log"),       columns=COLS["lat"])
 df_utg    = pd.DataFrame(parse_util_group(RUN_DIR / "utilization_cluster.log"),columns=COLS["utg"])
 df_utd    = pd.DataFrame(parse_util_device(RUN_DIR / "utilization.log"),       columns=COLS["utd"])
-df_events = pd.DataFrame(parse_events(RUN_DIR / "events_ns.log"),              columns=COLS["ev"])
+df_events = pd.DataFrame(parse_events(RUN_DIR / "cut_change_ns.log"),              columns=COLS["ev"])
 
 for name, df in [("rate summary", df_rate), ("rate timeline", df_tl),
                  ("batch timeline", df_batch), ("latency", df_lat),

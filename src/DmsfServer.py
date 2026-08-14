@@ -1,12 +1,17 @@
 import os
 import pickle
+import socket
 import sys
 import time
 import pika
 
 import DmsfResults as R
+import DmsfFreeTime as FT
+import DmsfMapEval as MapEval
+from DmsfBrokerRam import BrokerRamSampler
 from utils.split_selector import SplitSelector, SPLIT_CHANNELS_26N
-from DmsfScheduler import CLUSTER_ID, INTERMEDIATE_QUEUE, UTILIZATION_QUEUE
+from DmsfScheduler import (CLUSTER_ID, INTERMEDIATE_QUEUE, UTILIZATION_QUEUE,
+                           FREETIME_QUEUE, MSGSIZE_QUEUE, MAP_QUEUE)
 
 
 class DmsfServer:
@@ -45,7 +50,33 @@ class DmsfServer:
         # report sent to rpc_queue would never be consumed.
         self.channel.queue_declare(queue=UTILIZATION_QUEUE, durable=False)
         self.channel.queue_purge(queue=UTILIZATION_QUEUE)
+        # Every measurement queue is declared and purged here, whether or not
+        # its feature is on: a crashed run's stale reports must not be counted
+        # into this one, and a queue that exists but is never published to costs
+        # nothing.
+        for queue in (FREETIME_QUEUE, MSGSIZE_QUEUE, MAP_QUEUE):
+            self.channel.queue_declare(queue=queue, durable=False)
+            self.channel.queue_purge(queue=queue)
         self.reply_channel = self.connection.channel()
+
+        # ── measurement features (00 §5) ───────────────────────────────────────
+        # Every flag lives HERE, in the server's config, and travels in the
+        # dispatch message. No worker reads one from its own config file at run
+        # time, or a measurement setting has to be changed on N machines, the
+        # copies drift, and a run silently mixes two configurations
+        # (README invariant 9).
+        self.free_time_cfg = config.get('free_time') or {}
+        self.free_time_enable = bool(self.free_time_cfg.get('enable', False))
+        self.msg_size_cfg = config.get('message_size') or {}
+        self.msg_size_enable = bool(self.msg_size_cfg.get('enable', False))
+        self.map_cfg = config.get('map') or {}
+        self.map_enable = bool(self.map_cfg.get('enable', False))
+        self.map_window_batches = int(
+            self.map_cfg.get('window_batches', MapEval.DEFAULT_WINDOW_BATCHES))
+        # Exactly one worker measures payload size, and the SERVER picks it: the
+        # first edge to register (12 §1). Registration order needs no
+        # configuration, is stable within a run, and is known before dispatch.
+        self._msg_size_client = None
 
         # Throughput tracking (guide 02)
         self._fps_times = []          # every arrival — the authoritative series
@@ -71,9 +102,18 @@ class DmsfServer:
         self._util_log_path    = os.path.join(self.log_path, 'utilization.log')
         self._util_cl_log_path = os.path.join(self.log_path, 'utilization_cluster.log')
         self._lat_log_path     = os.path.join(self.log_path, 'latency_cluster.log')
-        self._events_log_path  = os.path.join(self.log_path, 'events_ns.log')
+        self._cut_log_path     = os.path.join(self.log_path, 'cut_change_ns.log')
+        self._ft_log_path      = os.path.join(self.log_path, 'free_time.log')
+        self._ft_cl_log_path   = os.path.join(self.log_path, 'free_time_cluster.log')
+        self._ft_ser_log_path  = os.path.join(self.log_path, 'free_time_series.log')
+        self._ram_ns_log_path  = os.path.join(self.log_path, 'broker_ram_ns.log')
+        self._ram_log_path     = os.path.join(self.log_path, 'broker_ram.log')
+        self._msz_log_path     = os.path.join(self.log_path, 'message_size.log')
+        self._msz_ser_log_path = os.path.join(self.log_path, 'message_size_series.log')
+        self._map_log_path     = os.path.join(self.log_path, 'map.log')
+        self._map_win_log_path = os.path.join(self.log_path, 'map_window.log')
         self._batch_size = config['server']['batch-size']
-        # All seven, once, centrally, before any worker can write. Truncating
+        # All sixteen, once, centrally, before any worker can write. Truncating
         # per-worker instead lets a late starter wipe a file another worker is
         # already appending to.
         R.truncate_all(self.log_path)
@@ -81,6 +121,21 @@ class DmsfServer:
         # leftover metrics_pivot.lock makes every later run skip its pivot, and
         # leftover metrics_raw_*.csv rows get merged into this run's summary.
         R.purge_scratch(self.log_path)
+        # And the write-once prediction cache, which is the dangerous one: it is
+        # keyed by frame index, so a leftover from run N wins forever — run N+1
+        # silently reuses it for every frame they share and the numbers look
+        # entirely plausible. map/label/ is ground truth and is never touched.
+        MapEval.purge_scratch(self.log_path)
+
+        # The queue host, sampled from the server for the whole run. The window
+        # opens HERE, in the constructor, before any worker has registered and
+        # long before anything is published: without a stretch of the host at
+        # rest there is no denominator for "what did running the system cost it"
+        # (11 §6).
+        self._ram = BrokerRamSampler(config, rabbit, self._ram_ns_log_path)
+        self._ram.start()
+        self._host = socket.gethostname()
+        self._host_cpu0 = FT.cpu_snapshot()
 
         self.register_clients = [0] * len(self.total_clients)
         self.list_clients = []
@@ -111,6 +166,13 @@ class DmsfServer:
             self.registered_ids.add(str(client_id))
             self.list_clients.append((str(client_id), layer_id))
             self.register_clients[layer_id - 1] += 1
+
+            # First edge to register measures the payload size — one worker, not
+            # the fleet. Every edge here publishes the same payload shape from
+            # the same split point, so nine measuring workers would produce one
+            # number nine times at nine times the cost (12 §1).
+            if layer_id == 1 and self._msg_size_client is None:
+                self._msg_size_client = str(client_id)
 
             self.client_devices[str(client_id)] = msg.get('device', 'cpu')
             et = msg.get('edge_times_ms')
@@ -516,6 +578,218 @@ class DmsfServer:
             f.write('\n'.join(lines_md))
         print(f"[Utilization] human report -> {util_md_path}")
 
+    def _drain_reports(self, queue, action, expected, timeout_s, label):
+        """Poll one measurement queue until every expected report is in, or the
+        timeout expires. Partial is acceptable and warns; it never hangs the run.
+
+        Reports are keyed by client, so a retry replaces rather than duplicates.
+        An unpicklable body is skipped, never raised — telemetry that takes the
+        shutdown path with it costs the whole run's results.
+        """
+        seen = {}
+        deadline = time.time() + timeout_s
+        while len(seen) < expected and time.time() < deadline:
+            method, _, body = self.channel.basic_get(queue=queue, auto_ack=True)
+            if not method:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if msg.get('action') != action:
+                continue
+            msg['client_id'] = str(msg.get('client_id', ''))
+            # Column 1 of every one of these files is the report's ARRIVAL at
+            # the server, not a device timestamp: device clocks are never
+            # assumed to be in sync, and the position in the run travels
+            # separately as an offset on the device's own clock.
+            msg['arrival_ns'] = time.time_ns()
+            seen[msg['client_id']] = msg
+        if len(seen) < expected:
+            print(f"[{label}] Collected {len(seen)}/{expected} report(s) before timeout")
+        return list(seen.values())
+
+    def _collect_free_time(self):
+        """free_time.log + free_time_cluster.log + free_time_series.log (10).
+
+        Skipped entirely when the feature is off, so shutdown never burns a
+        timeout polling a queue nobody will publish to — a stall and a scary
+        ``0/N`` caused by a setting working exactly as intended
+        (README invariant 10). The three files still exist, empty.
+        """
+        if not self.free_time_enable:
+            return
+        try:
+            records = self._drain_reports(
+                FREETIME_QUEUE, 'FREE_TIME', sum(self.total_clients),
+                float(self.free_time_cfg.get('collect_timeout_s', 30)), 'FreeTime')
+        except Exception as e:
+            print(f"[FreeTime] Warning: could not drain reports: {e}")
+            return
+        if not records:
+            print("[FreeTime] WARNING: no device reports — the three free-time "
+                  "logs are empty for this run")
+            return
+
+        host_idle = None
+        cpu1 = FT.cpu_snapshot()
+        if self._host_cpu0 and cpu1 and cpu1[1] > self._host_cpu0[1]:
+            host_idle = ((cpu1[0] - self._host_cpu0[0])
+                         / (cpu1[1] - self._host_cpu0[1]))
+        ts_ns = time.time_ns()
+        try:
+            R.write_free_time(self._ft_log_path, records, ts_ns)
+            R.write_free_time_cluster(self._ft_cl_log_path, records, ts_ns,
+                                      server_host=self._host,
+                                      server_host_idle=host_idle)
+            R.write_free_time_series(self._ft_ser_log_path, records, ts_ns)
+        except Exception as e:
+            print(f"[FreeTime] Warning: could not write result logs: {e}")
+            return
+        span = sum(r.get('span_ns', 0) for r in records)
+        free = sum(r.get('free_ns', 0) for r in records)
+        print(f"[FreeTime]    {len(records)} device line(s) -> {self._ft_log_path}")
+        print(f"[FreeTime]    roll-up -> {self._ft_cl_log_path}  "
+              f"(SYSTEM free={free / span * 100 if span else 0:.2f}%)")
+        print(f"[FreeTime]    series  -> {self._ft_ser_log_path}")
+
+    def _collect_message_size(self):
+        """message_size.log + message_size_series.log (12).
+
+        Exactly one report is expected because exactly one worker was told to
+        measure. Skipped whole when the feature is off.
+        """
+        if not self.msg_size_enable:
+            return
+        try:
+            reports = self._drain_reports(
+                MSGSIZE_QUEUE, 'MESSAGE_SIZE', 1,
+                float(self.msg_size_cfg.get('collect_timeout_s', 30)), 'MessageSize')
+        except Exception as e:
+            print(f"[MessageSize] Warning: could not drain reports: {e}")
+            return
+        if not reports:
+            print("[MessageSize] WARNING: no report from the elected worker — "
+                  "both message-size logs are empty for this run")
+            return
+        ts_ns = time.time_ns()
+        try:
+            lines = R.write_message_size(self._msz_log_path, reports,
+                                         self._batch_size, ts_ns)
+            R.write_message_size_series(self._msz_ser_log_path, reports, ts_ns)
+            for line in lines:
+                print(f"[MessageSize] {line}")
+        except Exception as e:
+            print(f"[MessageSize] Warning: could not write result logs: {e}")
+
+    def _collect_map(self):
+        """Drain map_queue: one zip of raw predictions per completing device.
+
+        Merged per CLUSTER, because the cluster is the scope the metric is
+        reported at and its devices share a split point, so their detections
+        form one valid pooled set. Expected counts the clouds, since each ships
+        one report and each holds part of the frame range.
+        """
+        if not self.map_enable:
+            return {}
+        collected = os.path.join(self.log_path, MapEval.COLLECT_ROOT)
+        expected = max(self.total_clients[-1], 1)
+        by_cluster, seen = {}, 0
+        deadline = time.time() + float(self.map_cfg.get('collect_timeout_s', 30))
+        while seen < expected and time.time() < deadline:
+            method, _, body = self.channel.basic_get(queue=MAP_QUEUE, auto_ack=True)
+            if not method:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if msg.get('action') != 'MAP_PRED':
+                continue
+            seen += 1
+            cluster = msg.get('cluster') or 'unknown'
+            destination = os.path.join(collected, MapEval.safe_name(cluster))
+            n = MapEval.unpack_predictions(msg.get('payload') or b'', destination)
+            by_cluster[cluster] = destination
+            print(f"[mAP] {cluster}: {n} prediction file(s) after "
+                  f"{str(msg.get('client_id', ''))[:8]}")
+        if seen < expected:
+            print(f"[mAP] Collected {seen}/{expected} device report(s) before timeout")
+        return by_cluster
+
+    def _write_map_files(self, by_cluster):
+        """map.log + map_window.log — this project's extension, scored HERE.
+
+        mAP is a ranking metric over a pooled detection set, so a per-device
+        score has no combination that reconstructs the cluster's. Every failure
+        path degrades to a warning and an omitted line: a missing ground-truth
+        file must never cost the run one of its fourteen result files.
+        """
+        if not self.map_enable:
+            return
+        label_dir = os.path.join(self.log_path, MapEval.LABEL_ROOT)
+        gts = MapEval.load_boxes(label_dir)
+        if not gts:
+            print(f"[mAP] WARNING: no ground truth in {label_dir} — "
+                  f"map.log and map_window.log are empty for this run")
+            return
+        if not by_cluster:
+            print("[mAP] WARNING: no predictions collected — "
+                  "map.log and map_window.log are empty for this run")
+            return
+
+        max_det = int(self.map_cfg.get('max_det', 100))
+        per_cluster = {}
+        for cluster, directory in by_cluster.items():
+            preds = MapEval.load_boxes(directory, with_conf=True, max_det=max_det)
+            if preds:
+                n_batches = (max(preds) - 1) // self._batch_size + 1
+                print(f"[mAP] scoring {cluster}: {len(preds)} predicted frame(s) "
+                      f"vs {len(gts)} GT frame(s), "
+                      f"{max(n_batches - self.map_window_batches + 1, 1)} window(s), "
+                      f"max_det={max_det} — this takes a minute or two")
+            if not preds:
+                print(f"[mAP] WARNING: {cluster} shipped no readable predictions "
+                      f"— omitted (a 0.0000 would be a false accuracy claim)")
+                continue
+            result = MapEval.evaluate_cluster(preds, gts, self._batch_size,
+                                              self.map_window_batches)
+            if result["all"][0] is None and not result["windows"]:
+                print(f"[mAP] WARNING: {cluster} matched no ground-truth frame "
+                      f"— omitted rather than written as zeros")
+                continue
+            per_cluster[cluster] = result
+
+        ts_ns = time.time_ns()          # one timestamp for the whole collection
+        try:
+            for line in R.write_map(self._map_log_path, ts_ns, per_cluster,
+                                    self.map_window_batches):
+                print(f"[mAP] {line}")
+            windows = R.write_map_window(self._map_win_log_path, ts_ns, per_cluster)
+            print(f"[mAP] {len(windows)} window line(s) -> {self._map_win_log_path}")
+        except Exception as e:
+            print(f"[mAP] Warning: could not write the accuracy logs: {e}")
+
+    def _collect_and_write_map(self):
+        """Collect the predictions, then score them. One step so that a failure
+        in either half cannot leave the other half half-done."""
+        self._write_map_files(self._collect_map())
+
+    def _write_broker_ram(self):
+        """Stop the sampler past the drain, then write its summary (11 §6)."""
+        if not self._ram.enabled:
+            return
+        try:
+            self._ram.stop()
+            lines = R.write_broker_ram(self._ram_log_path, self._ram.samples,
+                                       self._ram.meta())
+            for line in lines:
+                print(f"[BrokerRAM] {line}")
+        except Exception as e:
+            print(f"[BrokerRAM] Warning: could not write the summary: {e}")
+
     def notify_clients(self, start=True):
         if start:
             split_point = self._select_split_point()
@@ -525,7 +799,7 @@ class DmsfServer:
             # would append here on every cut change too.
             try:
                 mode = ('auto' if self.split_point_cfg == 'auto' else 'fixed')
-                R.append_event(self._events_log_path, time.time_ns(), CLUSTER_ID,
+                R.append_event(self._cut_log_path, time.time_ns(), CLUSTER_ID,
                                f"split point set to {split_point} ({mode})")
             except Exception as e:
                 print(f"[Events] Warning: could not log split-point event: {e}")
@@ -550,9 +824,30 @@ class DmsfServer:
                     'device_edge': client_device if layer_id == 1 else 'cpu',
                     'device_cloud': client_device if layer_id > 1 else 'cpu',
                     'num_layers':  len(self.total_clients),
+                    # Every measurement setting for this run, decided here and
+                    # carried to the worker. A worker reads none of these from
+                    # its own config file (README invariant 9), so a run can
+                    # never silently mix two measurement configurations.
+                    'measure': {
+                        'free_time':      self.free_time_enable,
+                        'free_time_bucket_s': float(
+                            self.free_time_cfg.get('bucket_s', 1.0)),
+                        # ... and exactly one worker is told to measure size.
+                        'message_size':   (self.msg_size_enable
+                                           and str(client_id) == self._msg_size_client),
+                        'map':            self.map_enable,
+                        'map_conf':       float(self.map_cfg.get('conf', 0.001)),
+                        'cluster':        CLUSTER_ID,
+                    },
                 }
                 self._send_to_client(client_id, response)
             self._fps_start_t = time.time()   # clock starts when START is dispatched
+            # The host stops being at rest here, not when the first message
+            # lands: marks partition the RAM series, they never gate it (11 §6).
+            self._ram.mark('run')
+            if self.msg_size_enable and self._msg_size_client:
+                print(f"[MessageSize] elected {self._msg_size_client[:8]} "
+                      f"(first edge to register) as the measuring worker")
         else:
             response = {'action': 'STOP', 'message': 'Stop inference !!!'}
             for (client_id, _) in self.list_clients:
@@ -622,8 +917,21 @@ class DmsfServer:
             return
         self._finalized = True
         # Shutdown order per 01 §4: throughput summary, then the device reports
-        # and everything rolled up from them, then the archive.
+        # and everything rolled up from them, then the RAM summary — which
+        # closes its window a couple of seconds past the last real collector —
+        # then the accuracy pair, then the archive. The archive runs last so the
+        # snapshot is complete, and unconditionally so a run that produced a
+        # partial set still keeps that partial set.
+        #
+        # The accuracy step is deliberately LAST of the measurement steps, and
+        # that is also why the RAM window closes BEFORE it: scoring takes
+        # minutes on a long run, and leaving it inside the window stretches
+        # `phase=run` across a stretch where nothing is running, quietly
+        # dragging `run_minus_idle_mb` toward zero. Nothing in the accuracy path
+        # may cost — or distort — one of the fourteen result files.
         for step in (self._write_rate_summary, self._collect_utilization,
+                     self._collect_free_time, self._collect_message_size,
+                     self._write_broker_ram, self._collect_and_write_map,
                      self._archive_run):
             try:
                 step()

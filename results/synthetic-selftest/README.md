@@ -13,10 +13,16 @@ to point it at:
    arrivals, so `batch_done_ns.log` and `fps_cluster_ns.log` are written by the
    code the server will run, not by a stand-in.
 2. The shutdown writers in `src/DmsfResults.py` were called with synthetic device
-   reports (3 edge + 2 cloud, one cluster).
-3. `guide/validate_results.py` passes with **0 errors, 0 warnings**, and a
-   deliberately corrupted copy is caught.
-4. The notebook renders all nine charts into `imgs/` with zero cell errors.
+   reports (3 edge + 2 cloud, one cluster) — **all fourteen** result files plus
+   the two accuracy files.
+3. Free time goes through the real `FreeTimeTracker`, so the union, the exact
+   `busy + free == span`, and the priority-ordered reason attribution are
+   computed rather than fabricated. The accuracy pair goes through the real
+   metric on invented boxes: a real computation over a fake detection set.
+4. `guide/validate_results.py` reports **14/14 result files present, 6/6
+   required** with **0 errors, 0 warnings**, and a deliberately corrupted copy is
+   caught.
+5. The notebook renders its charts into `imgs/` with zero cell errors.
 
 ## Replacing it with a real run
 

@@ -52,6 +52,8 @@ sys.path.insert(0, str(BASE))
 sys.path.insert(0, str(BASE / "src"))
 
 import DmsfResults as R                      # noqa: E402
+import DmsfFreeTime as FT                     # noqa: E402
+import DmsfMapEval as ME                      # noqa: E402
 from DmsfScheduler import CLUSTER_ID          # noqa: E402
 from DmsfServer import DmsfServer             # noqa: E402
 
@@ -101,7 +103,7 @@ def main():
     srv.time.time_ns = real_time_ns
 
     # --- one control-plane decision, at dispatch -----------------------------
-    R.append_event(str(OUT / "events_ns.log"), t0 - 3_100_000_000, CLUSTER_ID,
+    R.append_event(str(OUT / "cut_change_ns.log"), t0 - 3_100_000_000, CLUSTER_ID,
                    "split point set to 7 (auto)")
 
     # --- synthetic device reports --------------------------------------------
@@ -129,6 +131,58 @@ def main():
             }
             records.append(rec)
 
+    # --- synthetic free-time reports -----------------------------------------
+    # Built through the REAL FreeTimeTracker, one work span and one wait span
+    # per unit, so the interval algebra (union, complement, priority-ordered
+    # attribution) is what produces the numbers rather than the fixture.
+    ft_reports = []
+    for rec in records:
+        tracker = FT.FreeTimeTracker(
+            enabled=True, cluster=CLUSTER_ID, client_id=rec["client_id"],
+            role=rec["role"], device="cpu", bucket_s=1.0, log_path=str(OUT))
+        tracker.start()
+        # Replay the device's life on the tracker's own monotonic clock.
+        tracker._mono0 = 0
+        tracker._epoch0 = t0 + (0 if rec["role"] == "edge" else 3_000_000_000)
+        cursor = 0
+        for sample_ms in rec["service_ms"]:
+            busy_ns = int(sample_ms * 1e6)
+            idle_ns = int(busy_ns * (0.35 if rec["role"] == "edge" else 0.08))
+            tracker.add_work("inference", cursor, cursor + busy_ns)
+            tracker.add_wait("input", cursor + busy_ns, cursor + busy_ns + idle_ns)
+            cursor += busy_ns + idle_ns
+        tracker._mono1 = cursor
+        report = tracker.report()
+        report["arrival_ns"] = t_ns + 1_000_000
+        ft_reports.append(report)
+
+    # --- synthetic broker-RAM samples ----------------------------------------
+    ram, base = [], 1600.0
+    for i in range(240):
+        phase = "idle" if i < 30 else ("run" if i < 225 else "tail")
+        load = 0.0 if phase == "idle" else (420.0 if phase == "run" else 120.0)
+        ram.append({"ts_ns": t0 - 30_000_000_000 + i * 1_000_000_000,
+                    "phase": phase, "source": "ssh", "total_mb": 5921.5,
+                    "used_mb": base + load + 40 * rng.random(),
+                    "avail_mb": 4000.0, "rss_mb": 90.0 + load / 3,
+                    "swap_used_mb": 1032.3})
+
+    # --- one measured worker's payload sizes ---------------------------------
+    sizes = [int(rng.gauss(39_000_000, 400_000)) for _ in range(N_UNITS)]
+    msg_report = {
+        "client_id": records[0]["client_id"], "role": "edge",
+        "cluster": CLUSTER_ID, "arrival_ns": t_ns + 1_000_000,
+        "context": {"mode": "split", "split_point": 7, "compress": "on",
+                    "num_bit": 1, "machine": "machine-2"},
+        "n": len(sizes), "total_bytes": sum(sizes),
+        "mean_bytes": sum(sizes) / len(sizes),
+        "p50_bytes": sorted(sizes)[len(sizes) // 2],
+        "p95_bytes": sorted(sizes)[int(len(sizes) * 0.95)],
+        "max_bytes": max(sizes), "min_bytes": min(sizes),
+        "span_s": N_UNITS * 3.0,
+        "series": [(i, i * 3.0, i, v) for i, v in enumerate(sizes)],
+    }
+
     # --- the real shutdown writers -------------------------------------------
     R.write_rate_summary(str(OUT / "fps_cluster.log"), s._fps_start_t,
                          s._cluster_times, BATCH)
@@ -136,13 +190,56 @@ def main():
         R.append_utilization_device(str(OUT / "utilization.log"), r)
     R.write_utilization_cluster(str(OUT / "utilization_cluster.log"), records)
     R.write_latency_cluster(str(OUT / "latency_cluster.log"), records)
+    R.write_free_time(str(OUT / "free_time.log"), ft_reports)
+    R.write_free_time_cluster(str(OUT / "free_time_cluster.log"), ft_reports,
+                              server_host="synthetic-controller",
+                              server_host_idle=0.97)
+    R.write_free_time_series(str(OUT / "free_time_series.log"), ft_reports)
+    R.write_broker_ram(str(OUT / "broker_ram.log"), ram,
+                       {"host": "192.168.101.91", "source": "ssh",
+                        "interval_s": 1.0, "reason": ""})
+    with open(OUT / "broker_ram_ns.log", "w") as f:
+        for sample in ram:
+            f.write(f"{sample['ts_ns']} host=192.168.101.91 source=ssh "
+                    f"phase={sample['phase']} total_mb={sample['total_mb']:.1f} "
+                    f"used_mb={sample['used_mb']:.1f} "
+                    f"used={sample['used_mb'] / sample['total_mb'] * 100:.2f}% "
+                    f"avail_mb={sample['avail_mb']:.1f} "
+                    f"swap_used_mb={sample['swap_used_mb']:.1f} "
+                    f"rabbit_rss_mb={sample['rss_mb']:.1f}\n")
+    R.write_message_size(str(OUT / "message_size.log"), [msg_report], BATCH)
+    R.write_message_size_series(str(OUT / "message_size_series.log"), [msg_report])
+
+    # --- accuracy: the two files that are NOT part of the contract -----------
+    # Scored through the real metric, on invented boxes: a jittered copy of the
+    # "truth" is the prediction, so the score is a real computation over a fake
+    # detection set.
+    gts, preds = {}, {}
+    for frame in range(1, 16 * BATCH * 2 + 1):
+        boxes = []
+        for _ in range(6):
+            cx, cy = 0.1 + 0.8 * rng.random(), 0.1 + 0.8 * rng.random()
+            boxes.append((rng.randrange(3), cx, cy, 0.08, 0.06))
+        gts[frame] = [(c, 1.0, (cx - w / 2) * 640, (cy - h / 2) * 640,
+                       (cx + w / 2) * 640, (cy + h / 2) * 640)
+                      for c, cx, cy, w, h in boxes]
+        preds[frame] = [(c, 0.3 + 0.7 * rng.random(),
+                         (cx - w / 2) * 640 + rng.gauss(0, 6),
+                         (cy - h / 2) * 640 + rng.gauss(0, 6),
+                         (cx + w / 2) * 640 + rng.gauss(0, 6),
+                         (cy + h / 2) * 640 + rng.gauss(0, 6))
+                        for c, cx, cy, w, h in boxes]
+    per_cluster = {CLUSTER_ID: ME.evaluate_cluster(preds, gts, BATCH, 16)}
+    map_ts = t_ns + 2_000_000
+    R.write_map(str(OUT / "map.log"), map_ts, per_cluster, 16)
+    R.write_map_window(str(OUT / "map_window.log"), map_ts, per_cluster)
 
     (OUT / "config.yaml").write_text(
         "# SYNTHETIC self-test fixture — not a real run.\n"
         "server:\n  batch-size: 32\n  clients: [3, 2]\ndmsf:\n  split-point: 7\n",
         encoding="utf-8")
 
-    for name in R.RESULT_FILES:
+    for name in R.RESULT_FILES + R.MAP_FILES:
         p = OUT / name
         print(f"  {name:<26} {p.stat().st_size:>8} bytes  "
               f"{sum(1 for _ in p.open()):>5} lines")

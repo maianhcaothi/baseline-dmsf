@@ -9,11 +9,22 @@ import torch
 from tqdm import tqdm
 
 from utils.metrics import non_max_suppression
+from DmsfFreeTime import FreeTimeTracker
+from DmsfMessageSize import MessageSizeRecorder
+from DmsfMapEval import PredictionWriter
 
 
 INTERMEDIATE_QUEUE = 'dmsf_intermediate_queue'
 METRICS_EXCHANGE   = 'dmsf_metrics_fanout'
 UTILIZATION_QUEUE  = 'utilization_queue'
+# One dedicated queue per measurement, for the reason UTILIZATION_QUEUE exists:
+# the server stops reading control the moment the last edge reports, but the
+# clouds finish later, so a report sent to rpc_queue would never be consumed. On
+# its own queue a report simply waits on the broker — publisher and consumer
+# never need to be alive at the same moment.
+FREETIME_QUEUE     = 'freetime_queue'
+MSGSIZE_QUEUE      = 'msgsize_queue'
+MAP_QUEUE          = 'map_queue'
 
 # This baseline runs a single edge->cloud cluster. The result format is written
 # cluster-generic anyway (guide 01 §3.2-3.3), so an N-cluster variant only has to
@@ -56,6 +67,15 @@ class DmsfScheduler:
         self._pipeline_ms = []
         self._e2e_ms = []
 
+        # Optional measurements. Every one of them is off until the server says
+        # otherwise in the dispatch message — this device reads no measurement
+        # setting from its own config file (README invariant 9), so a stale
+        # config on one machine can never make a run mix two configurations.
+        self._measure = {}
+        self._ft = FreeTimeTracker(enabled=False)
+        self._msg_size = MessageSizeRecorder(enabled=False)
+        self._preds = PredictionWriter(enabled=False)
+
         self.channel.queue_declare(queue=INTERMEDIATE_QUEUE, durable=False)
         self.channel.queue_declare(queue=UTILIZATION_QUEUE, durable=False)
 
@@ -93,14 +113,23 @@ class DmsfScheduler:
         imgsz = (self.config.get('inference') or {}).get('imgsz') \
                 or self.config.get('dmsf', {}).get('imgsz', 640)
 
+        ft = self._ft
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        # Opened where the timing log opens, so free time's span_s and
+        # utilization's total_s describe the same stretch of this device's life.
+        ft.start()
 
         batch_open_ns = None      # when this unit's first frame entered the stage
 
         while True:
+            # Frame capture is real work that happens BEFORE `get input`, so
+            # utilization cannot see it and free time must. This is the whole
+            # reason free time is not 1 - utilization on this project's edge.
+            t_lane = ft.now()
             ret, frame = cap.read()
             if not ret:
+                ft.add_work('capture', t_lane)
                 break
             if not buf:
                 # The unit starts existing here. Frame decode + resize for the
@@ -111,6 +140,7 @@ class DmsfScheduler:
             frame = cv2.resize(frame, (imgsz, imgsz))
             t = torch.from_numpy(frame[:, :, ::-1].copy()).float() / 255.0
             buf.append(t.permute(2, 0, 1))
+            ft.add_work('capture', t_lane)
 
             if len(buf) < batch_size:
                 continue
@@ -118,18 +148,35 @@ class DmsfScheduler:
             with open(self._timing_log_edge, "a") as _tf:
                 print(str(time.time_ns()) + " get input", file=_tf)
 
+            t_lane = ft.now()
             imgs = torch.stack(buf).to(self.device)
             buf  = []
+            ft.add_work('tensor', t_lane)
 
             edge_start_wall = time.time()
             t0 = time.perf_counter()
 
+            t_lane = ft.now()
             payload = model.forward_edge(imgs, split_point)
+            ft.add_work('inference', t_lane)
             payload['edge_start_time'] = edge_start_wall
+            # The unit's position in the SOURCE, so the cloud can name the
+            # frames it predicts. A cloud takes an arbitrary subset off a shared
+            # queue, so its own counter would name every frame wrongly.
+            payload['batch_id'] = batch_id
+            t_lane = ft.now()
             msg = pickle.dumps({'action': 'FEATURES', 'data': payload})
             msg_bytes = len(msg)
+            ft.add_work('serialize', t_lane)
 
+            # Recorded BEFORE the publish call: a broker at its high-water mark
+            # stops accepting, and those are exactly the runs this measurement
+            # exists to explain (12 §2). The size is the serialized byte count
+            # handed to the transport, not a pre-serialization tensor size.
+            self._msg_size.record(msg_bytes, batch_id)
+            t_lane = ft.now()
             self.channel.basic_publish(exchange='', routing_key=INTERMEDIATE_QUEUE, body=msg)
+            ft.add_work('send', t_lane)
 
             out_ns = time.time_ns()
             with open(self._timing_log_edge, "a") as _tf:
@@ -138,12 +185,14 @@ class DmsfScheduler:
                 self._pipeline_ms.append((out_ns - batch_open_ns) / 1e6)
                 batch_open_ns = None
 
+            t_lane = ft.now()
             latency_ms = (time.perf_counter() - t0) * 1000
             fps_val    = batch_size / (time.perf_counter() - prev_end) if prev_end else 0.0
             ram_mb     = proc.memory_info().rss / 1e6
 
             self._write_metrics(log_path, split_point, 'edge', batch_id, batch_size,
                                 latency_ms, fps_val, ram_mb, msg_bytes, 0.0, edge_start_wall)
+            ft.add_work('metrics', t_lane)
 
             batch_id += 1
             prev_end  = time.perf_counter()
@@ -155,11 +204,17 @@ class DmsfScheduler:
         if buf:
             with open(self._timing_log_edge, "a") as _tf:
                 print(str(time.time_ns()) + " get input", file=_tf)
+            t_lane = ft.now()
             imgs    = torch.stack(buf).to(self.device)
             payload = model.forward_edge(imgs, split_point)
             payload['edge_start_time'] = time.time()
+            payload['batch_id'] = batch_id
             msg = pickle.dumps({'action': 'FEATURES', 'data': payload})
+            ft.add_work('inference', t_lane)
+            self._msg_size.record(len(msg), batch_id)
+            t_lane = ft.now()
             self.channel.basic_publish(exchange='', routing_key=INTERMEDIATE_QUEUE, body=msg)
+            ft.add_work('send', t_lane)
             out_ns = time.time_ns()
             with open(self._timing_log_edge, "a") as _tf:
                 print(str(out_ns) + " output", file=_tf)
@@ -168,6 +223,7 @@ class DmsfScheduler:
 
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        ft.stop()
 
         total_batches_sent = batch_id + (1 if buf else 0)
         cap.release()
@@ -177,6 +233,8 @@ class DmsfScheduler:
         # Measurement goes out on its own queue, before the control message, so
         # it is already sitting on the broker when the server drains at shutdown.
         self._send_utilization(self._compute_utilization(self._timing_log_edge, 'edge'))
+        self._send_free_time()
+        self._send_message_size()
 
         # Broadcast edge metrics CSV to all cloud clients via fanout exchange
         metrics_file = os.path.join(log_path, f"metrics_raw_{self._id_tag}.csv")
@@ -243,15 +301,23 @@ class DmsfScheduler:
 
         self.channel.queue_declare(queue='fps_queue', durable=False)
 
+        ft = self._ft
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        ft.start()
+        map_conf = float(self._measure.get('map_conf', 0.001))
 
         while True:
+            # Only classifiable after it returns: an empty get is free time, a
+            # get that yields a unit is work. Take the timestamp before the
+            # call and label the span after it, rather than guessing (10 §2).
+            t_lane = ft.now()
             method, _, body = self.channel.basic_get(
                 queue=INTERMEDIATE_QUEUE, auto_ack=True)
 
             if method and body:
                 msg = pickle.loads(body)
+                ft.add_work('recv', t_lane)
 
                 # Sentinel = server signals all edge batches are in the queue
                 if msg.get('action') == 'SENTINEL':
@@ -269,15 +335,32 @@ class DmsfScheduler:
                 recv_size = len(body)
                 payload = msg['data']
                 edge_start_time = payload.pop('edge_start_time', time.time())
+                src_batch_id = payload.pop('batch_id', None)
 
                 t0 = time.perf_counter()
+                t_lane = ft.now()
                 out  = model.forward_cloud(
                     {'x_bit': payload['x_bit'], 'mu': payload['mu'],
                      'sigma': payload['sigma'], 'split': payload['split']},
                     device=str(self.device)
                 )
+                ft.add_work('inference', t_lane)
                 pred = out[0] if isinstance(out, tuple) else out
-                non_max_suppression(pred, conf, iou)
+                t_lane = ft.now()
+                dets = non_max_suppression(pred, conf, iou)
+                ft.add_work('postprocess', t_lane)
+
+                if self._preds.enabled:
+                    # The accuracy path, and everything about it is inside the
+                    # get input -> output window on purpose: it is work this run
+                    # really did, so it belongs in busy_s, service, pipeline and
+                    # e2e. That is also why a run with this on is not comparable
+                    # with one without it.
+                    t_lane = ft.now()
+                    low = (dets if abs(map_conf - conf) < 1e-12
+                           else non_max_suppression(pred, map_conf, iou))
+                    self._preds.write_batch(low, src_batch_id, batch_size)
+                    ft.add_work('map', t_lane)
 
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
@@ -300,14 +383,18 @@ class DmsfScheduler:
                 # split that is the tail. Two publishers would double the
                 # measured throughput. The body is an identity — the producing
                 # cluster — with no timestamp and no unit id in it.
+                t_lane = ft.now()
                 self.channel.basic_publish(
                     exchange='', routing_key='fps_queue',
                     body=CLUSTER_ID.encode())
+                ft.add_work('send', t_lane)
                 self._pipeline_ms.append((time.time_ns() - deq_ns) / 1e6)
 
+                t_lane = ft.now()
                 self._write_metrics(log_path, split_point, 'cloud', batch_id, bs,
                                     latency_ms, fps_val, ram_mb, recv_size,
                                     e2e_ms, edge_start_time)
+                ft.add_work('metrics', t_lane)
 
                 batch_id += 1
                 prev_end  = time.perf_counter()
@@ -315,14 +402,21 @@ class DmsfScheduler:
 
             else:
                 time.sleep(0.1)
+                # The empty get and the sleep that follows it are one idle
+                # stretch, and the reason is starvation: this cloud has nothing
+                # to work on because no edge has published yet.
+                ft.add_wait('input', t_lane)
 
         self._finish_fps()
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        ft.stop()
 
         # Measurement first, on its own queue, then the control message.
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, 'cloud'))
+        self._send_free_time()
+        self._send_predictions()
 
         self.channel.basic_publish(
             exchange='', routing_key='rpc_queue',
@@ -467,6 +561,79 @@ class DmsfScheduler:
             print(f"[Utilization] Warning: could not send: {e}")
 
     # ---------------------------------------------------------------------- #
+    # Optional measurements — each ships on its own queue, at finish
+    # ---------------------------------------------------------------------- #
+    def _publish_report(self, queue, payload, label):
+        """One report onto one dedicated measurement queue.
+
+        Same reasoning as the utilization queue: the server drains these at
+        shutdown, long after this device has exited, so the report waits on the
+        broker instead of needing both ends alive at once. Every failure path
+        here is a warning — telemetry never kills the run.
+        """
+        try:
+            self.channel.queue_declare(queue=queue, durable=False)
+            self.channel.basic_publish(exchange='', routing_key=queue,
+                                       body=pickle.dumps(payload))
+            return True
+        except Exception as e:
+            print(f"[{label}] Warning: could not send report: {e}")
+            return False
+
+    def _send_free_time(self):
+        """This device's idle time — the report, plus its own local copy.
+
+        A disabled tracker returns no report at all rather than a report full of
+        zeros: "we did not measure" and "this device was never idle" are
+        different statements and must not be written the same way.
+        """
+        report = self._ft.report()
+        if report is None:
+            return
+        self._ft.write_local(report)
+        report['layer_id'] = self.layer_id
+        if self._publish_report(FREETIME_QUEUE, report, 'FreeTime'):
+            print(f"[FreeTime] Sent  role={report['role']:5s} "
+                  f"span={report['span_ns'] / 1e9:.3f}s "
+                  f"busy={report['busy_ns'] / 1e9:.3f}s "
+                  f"free={report['free_ns'] / 1e9:.3f}s "
+                  f"({report['free_ns'] / report['span_ns'] * 100:.2f}%, "
+                  f"{report['gaps']} gap(s))")
+
+    def _send_message_size(self):
+        """The elected edge's egress. Every other worker returns None here."""
+        report = self._msg_size.report()
+        if report is None:
+            return
+        if self._publish_report(MSGSIZE_QUEUE, report, 'MessageSize'):
+            print(f"[MessageSize] Sent  n={report['n']} "
+                  f"total_mb={report['total_bytes'] / 1e6:.3f} "
+                  f"mean_mb={report['mean_bytes'] / 1e6:.3f}")
+
+    def _send_predictions(self):
+        """Ship raw per-frame predictions; the SERVER scores them.
+
+        mAP is a ranking metric over a pooled detection set — the mean of two
+        devices' scores is not the score of their combined detections, and no
+        weighted combination reconstructs it. So nothing is reduced here. The
+        transfer happens at shutdown, entirely outside the measured window.
+        """
+        if not self._preds.enabled and not self._preds.written:
+            return
+        payload = self._preds.pack()
+        if payload is None:
+            return
+        if self._publish_report(MAP_QUEUE, {
+            'action': 'MAP_PRED',
+            'client_id': str(self.client_id),
+            'cluster': CLUSTER_ID,
+            'payload': payload,
+        }, 'mAP'):
+            print(f"[mAP] Sent  {self._preds.frames} prediction file(s) "
+                  f"({len(payload) / 1e3:.1f} kB zipped, "
+                  f"{self._preds.skipped} frame(s) already written by another device)")
+
+    # ---------------------------------------------------------------------- #
     # Pivot summary (mirrors split_inference Scheduler._pivot_and_save)
     # ---------------------------------------------------------------------- #
     def _pivot_and_save(self, log_path):
@@ -573,8 +740,34 @@ class DmsfScheduler:
     # Entry point called by DmsfRpcClient
     # ---------------------------------------------------------------------- #
     def inference_func(self, model, split_point, data, batch_size,
-                       conf, iou, log_path, num_layers):
+                       conf, iou, log_path, num_layers, measure=None,
+                       imgsz=640):
+        """Entry point called by DmsfRpcClient once START arrives.
+
+        ``measure`` is the server's measurement block, straight out of the
+        dispatch message. Everything optional this device does is switched on
+        from there and from nowhere else, so turning a feature off on the server
+        turns it off on every worker in the same run (README invariant 9).
+        """
+        self._measure = dict(measure or {})
+        self._ft = FreeTimeTracker(
+            enabled=self._measure.get('free_time', False),
+            cluster=CLUSTER_ID, client_id=self.client_id,
+            role='edge' if self.layer_id == 1 else 'cloud',
+            device=self.device,
+            bucket_s=self._measure.get('free_time_bucket_s', 1.0),
+            log_path=log_path)
         if self.layer_id == 1:
+            self._msg_size = MessageSizeRecorder(
+                enabled=self._measure.get('message_size', False),
+                cluster=CLUSTER_ID, client_id=self.client_id, role='edge',
+                context={'mode': 'split', 'split_point': split_point,
+                         'compress': 'on', 'num_bit': 1,
+                         'machine': self._id_tag},
+                log_path=log_path)
             self.first_layer(model, split_point, data, batch_size, log_path)
         elif self.layer_id == num_layers:
+            self._preds = PredictionWriter(
+                enabled=self._measure.get('map', False),
+                cluster=CLUSTER_ID, imgsz=imgsz, log_path=log_path)
             self.last_layer(model, split_point, batch_size, conf, iou, log_path)

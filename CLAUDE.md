@@ -29,8 +29,9 @@ The DMSF paper PDF is at `DMSF_A_Dynamic_Model_Splitting_Framework_for_Edge-Clou
 ## Result format (distributed run)
 
 `guide/` is the normative spec. This project uses the **cluster** naming
-scheme; never mix in the `group_*` names. Seven files, all truncated at server
-startup, all written to `config['log-path']`:
+scheme; never mix in the `group_*` names. **Fourteen** result files plus **two**
+accuracy files, all truncated at server startup, all written to
+`config['log-path']`:
 
 | File | Written | Granularity |
 |---|---|---|
@@ -40,7 +41,24 @@ startup, all written to `config['log-path']`:
 | `utilization.log` | shutdown | one line per device |
 | `utilization_cluster.log` | shutdown | `ALL`, cluster×role, `SYSTEM` |
 | `latency_cluster.log` | shutdown | pooled service / pipeline / e2e |
-| `events_ns.log` | live | one line per control decision |
+| `cut_change_ns.log` | live | one line per control decision |
+| `free_time.log` | shutdown | one line per device |
+| `free_time_cluster.log` | shutdown | cluster / role / `FREE` / `KIND` / `MACHINE` / `SYSTEM` |
+| `free_time_series.log` | shutdown | one device × one time bucket |
+| `broker_ram_ns.log` | live | one RAM sample of the queue host |
+| `broker_ram.log` | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT` / `PHASE` / `COMPARE` |
+| `message_size.log` | shutdown | one line per measured worker (normally one) |
+| `message_size_series.log` | shutdown | one line per published message |
+| `map.log` | shutdown | 2 per cluster (`WINDOW`, `ALL`) + 2 `OVERALL` |
+| `map_window.log` | shutdown | one sliding window per cluster |
+
+The last two are **NOT part of the portable contract** (`guide/00` §7) — they are
+this project's extension and must never stand in for a missing result file. They
+are `{:.4f}` ratios, deliberately not percentages, which is the one place this
+project departs from `guide/01` §1's percent rule.
+
+`events_ns.log` was renamed to `cut_change_ns.log`; both spellings are
+conformant but only one may exist per project (`guide/00` §4).
 
 ### Invariants that are easy to break
 
@@ -57,27 +75,82 @@ startup, all written to `config['log-path']`:
 - **`pipeline` ⊇ `service`.** `pipeline` is in-stage residency: on the edge it
   starts when the batch's first frame is read, on the cloud when the message is
   dequeued. The gap is buffering.
-- **Measurement rides `utilization_queue`, not `rpc_queue`.** The server stops
-  reading control the moment the last edge reports; the clouds finish later.
+- **Measurement rides its own queue, never `rpc_queue`.** `utilization_queue`,
+  `freetime_queue`, `msgsize_queue` and `map_queue` all exist for one reason: the
+  server stops reading control the moment the last edge reports, and the clouds
+  finish later. On a dedicated queue the report waits on the broker instead.
+- **A flag that travels is honoured at both ends.** When a feature is off the
+  server must skip its collector too, or shutdown burns the full timeout polling
+  a queue nobody will publish to and then warns `0/N` — a stall caused by a
+  setting working exactly as intended.
+- **The frame index for mAP comes from the EDGE's `batch_id`**, carried in the
+  `FEATURES` payload. A cloud's own counter counts an arbitrary subset of a
+  shared queue and would name every frame wrongly.
 - **Console summary format is pinned** by `guide/02-throughput.md` §7 — do not
   reflow those f-strings, the whitespace is the format. They contain em dashes,
   which is why the entrypoints reconfigure stdout to UTF-8.
 - **`W = 16`** for the rolling window. Charts assume it.
 - **Truncation and scratch purge are both central**, in `DmsfServer.__init__`.
-  `truncate_all` empties the seven logs; `purge_scratch` deletes
-  `metrics_pivot.lock` and `metrics_raw_*.csv`, which are write-once leftovers
-  that otherwise win over the current run forever (guide 05 §5).
+  `truncate_all` empties all 16 logs; `purge_scratch` deletes
+  `metrics_pivot.lock`, `metrics_raw_*.csv` and the device side-car logs;
+  `DmsfMapEval.purge_scratch` deletes `map/pred/` and `map/collect/`. All of them
+  are write-once leftovers that otherwise win over the current run forever
+  (guide 05 §5). `map/label/` is ground truth and is never touched.
 - **The shutdown hard cap is absolute.** `fps.shutdown_timeout_s` is measured
   from the STOP broadcast and never extended — an earlier version added 60 s
   whenever a cloud was still missing, which never terminates if that cloud is
   dead. A merely slow cloud finishes through `CLOUD_DONE` long before the cap.
 
-### Optional measurements deliberately not ported
+### Optional measurements — all four groups ported
 
 Free time (guide 10), infra-host RAM (guide 11) and message size (guide 12) are
-**not** implemented, and each is all-its-files-or-none. Do not add one file of a
-feature. The reasons are in `README.md`; porting one means working the whole
-§4b block of `guide/09-port-checklist.md`, feature flag included.
+implemented, each behind one flag in the **server's** `config.yaml` that travels
+in the dispatch message. Each is all-its-files-or-none: never add or remove one
+file of a feature.
+
+- **Free time** is not `1 − utilization` here. The edge's frame capture happens
+  before `get input`, so utilization cannot see it; `busy_s` is the **union** of
+  lane intervals, and `busy_s + free_s == span_s` exactly. The tracker's
+  `start()`/`stop()` sit at the same points as the timing log's `start`/`end`, so
+  `span_s` and `total_s` describe the same stretch — do not move one without the
+  other. A blocked `basic_publish` counts as `KIND kind=send` work, not as
+  `FREE reason=backpressure`: this project has no explicit backpressure signal,
+  so a blocked publish is indistinguishable from a slow one, and counting it as
+  busy biases free time **down**, which is the safe direction.
+- **Broker RAM** uses the management API on a loopback broker
+  (`source=rabbitmq_api`, `used_mb` = broker process, `total_mb` = its high-water
+  limit). The SSH path is the primary one and needs `broker_ram.host/user/
+  password` — those are **host** credentials, not the AMQP ones.
+- **Message size** is measured by exactly one edge, elected by the server as the
+  first to register. A worker must never decide this for itself.
+
+### Accuracy (`map.log`, `map_window.log`)
+
+Outside the portable contract, and off by default. Points that are easy to break:
+
+- The frame index comes from the **edge's** `batch_id`, which travels in the
+  `FEATURES` payload. The cloud's own counter is a count of an arbitrary subset
+  of a shared queue and would mis-name every frame.
+- Writes are **write-once**: every edge replays the same video, so several
+  devices reach the same frame and the first writer must win. `map/pred/` and
+  `map/collect/` are deleted in `DmsfServer.__init__` — a surviving write-once
+  cache wins forever and run N+1 silently reuses run N's predictions.
+- `map/label/` is ground truth and is never deleted. `make_map_labels.py`
+  generates **pseudo** labels (the same model at split 10, conf 0.25), so the
+  scores read as *agreement with the deepest-cut reference*, not as VisDrone
+  accuracy. Never quote them as model accuracy.
+- A cluster with no matched frames is omitted with a warning, never written as
+  `0.0000` — that would be a real accuracy claim, and a false one.
+- **`map.enable: true` makes the run's timing numbers non-comparable** with a
+  run without it: the prediction pass and the per-frame write are inside
+  `get input → output`, so they inflate `busy_s`, `service`, `pipeline` and
+  `e2e`. Measured: fps −16%, cloud `busy_s` +21%, `e2e` +22% (`PORT-NOTES.md` §4).
+  The run tag stays `fixed-spN` (guide 05 §2 keeps the vocabulary closed); an
+  accuracy run is identifiable because it is the only one carrying `map.log`.
+- **Scoring is a shutdown step measured in minutes**, not seconds: 237 windows
+  over 2015 frames takes 1–4 min. `map.max_det` (COCO's 100) and
+  `map.window_batches` are the two knobs; `max_det` is applied on the server, so
+  the archived `.txt` files stay complete and re-scorable.
 
 ### Verifying a run
 
