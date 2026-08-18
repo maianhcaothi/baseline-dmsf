@@ -51,6 +51,13 @@ PRED_ROOT = os.path.join("map", "pred")
 LABEL_ROOT = os.path.join("map", "label")
 COLLECT_ROOT = os.path.join("map", "collect")
 
+#: Ground truth is the one input to this measurement that is NOT produced by the
+#: run, so it is the one location worth being able to move: real VisDrone labels,
+#: a second pseudo-label set made at another reference cut, or one shared folder
+#: that several checkouts score against. ``map.label_path`` in the config
+#: overrides it; blank keeps ``<log-path>/map/label``.
+LABEL_PATH_KEYS = ("label_path", "label-path")
+
 #: Matches W in guide/02 §6, so a step in the accuracy series and a dip in the
 #: throughput series cover the same span of the run.
 DEFAULT_WINDOW_BATCHES = 16
@@ -60,7 +67,34 @@ def safe_name(text):
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(text))
 
 
-def purge_scratch(log_path):
+def resolve_label_dir(map_cfg=None, log_path="."):
+    """Where ground truth lives: ``map.label_path``, else ``<log-path>/map/label``.
+
+    ONE resolver, called by both the server that scores and the generator that
+    writes, because a label path that is read differently by the two is worse
+    than no configuration at all: the generator fills one folder, the server
+    scores an empty one, and the run reports "no ground truth" for a set that
+    exists. Prefer importing this over rebuilding the path from ``LABEL_ROOT``.
+
+    A relative value is resolved against ``log-path``, which is where the
+    default already sits, so ``map/label`` and the default name the same folder.
+    An absolute value is taken as given — that is the point of the setting.
+    Blank, missing, or a config without a ``map`` section all keep the default,
+    so an older config.yaml needs no edit.
+    """
+    value = ""
+    for key in LABEL_PATH_KEYS:
+        if map_cfg and map_cfg.get(key):
+            value = str(map_cfg.get(key)).strip()
+            break
+    if not value:
+        return os.path.join(log_path, LABEL_ROOT)
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    return os.path.normpath(os.path.join(log_path, value))
+
+
+def purge_scratch(log_path, label_dir=None):
     """Delete ``map/pred/`` and ``map/collect/`` — centrally, at startup.
 
     A write-once cache that survives a run **wins forever**: run N+1 silently
@@ -68,17 +102,29 @@ def purge_scratch(log_path):
     entirely plausible, which is what makes this worth deleting rather than
     detecting. Done in the component that starts once — doing it per worker
     would let a late starter wipe files an earlier worker is already writing.
-    ``map/label/`` is ground truth and is never touched.
+    Ground truth is never touched. ``label_dir`` says where it is now that
+    ``map.label_path`` can point it anywhere, INCLUDING inside one of these two
+    trees — a config that costs someone a label set they spent an hour
+    generating is a bad trade for a startup convenience, so an overlapping root
+    is skipped with a warning rather than deleted.
     """
+    protected = os.path.abspath(label_dir or os.path.join(log_path, LABEL_ROOT))
     removed = 0
     for root in (PRED_ROOT, COLLECT_ROOT):
         path = os.path.join(log_path, root)
-        if os.path.isdir(path):
-            try:
-                shutil.rmtree(path)
-                removed += 1
-            except OSError as e:
-                print(f"[mAP] Warning: could not remove {path}: {e}")
+        if not os.path.isdir(path):
+            continue
+        target = os.path.abspath(path)
+        if protected == target or protected.startswith(target + os.sep):
+            print(f"[mAP] Not purging {path}: the ground truth ({protected}) "
+                  f"lives inside it. Move map.label_path out of map/pred and "
+                  f"map/collect, or last run's predictions stay and win.")
+            continue
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except OSError as e:
+            print(f"[mAP] Warning: could not remove {path}: {e}")
     return removed
 
 

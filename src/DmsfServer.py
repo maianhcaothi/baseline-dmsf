@@ -112,6 +112,24 @@ class DmsfServer:
         self._msz_ser_log_path = os.path.join(self.log_path, 'message_size_series.log')
         self._map_log_path     = os.path.join(self.log_path, 'map.log')
         self._map_win_log_path = os.path.join(self.log_path, 'map_window.log')
+        # Ground truth is the only input to this measurement the run does not
+        # produce, so it is the only one worth relocating: `map.label_path`
+        # points at real VisDrone labels, a second reference set, or a folder
+        # shared between checkouts. Resolved ONCE, here, and printed at startup
+        # — an empty label folder is otherwise only discovered at shutdown,
+        # after the whole run has been paid for.
+        self.map_label_dir = MapEval.resolve_label_dir(self.map_cfg, self.log_path)
+        if self.map_enable:
+            n_labels = 0
+            if os.path.isdir(self.map_label_dir):
+                n_labels = len([n for n in os.listdir(self.map_label_dir)
+                                if n.endswith('.txt')])
+            print(f"[mAP] ground truth: {self.map_label_dir} "
+                  f"({n_labels} label file(s))")
+            if not n_labels:
+                print("[mAP] WARNING: no labels there — this run will produce "
+                      "empty map.log and map_window.log. Generate them with "
+                      "`python make_map_labels.py`, or fix map.label_path.")
         self._batch_size = config['server']['batch-size']
         # All sixteen, once, centrally, before any worker can write. Truncating
         # per-worker instead lets a late starter wipe a file another worker is
@@ -125,7 +143,7 @@ class DmsfServer:
         # keyed by frame index, so a leftover from run N wins forever — run N+1
         # silently reuses it for every frame they share and the numbers look
         # entirely plausible. map/label/ is ground truth and is never touched.
-        MapEval.purge_scratch(self.log_path)
+        MapEval.purge_scratch(self.log_path, self.map_label_dir)
 
         # The queue host, sampled from the server for the whole run. The window
         # opens HERE, in the constructor, before any worker has registered and
@@ -729,7 +747,7 @@ class DmsfServer:
         """
         if not self.map_enable:
             return
-        label_dir = os.path.join(self.log_path, MapEval.LABEL_ROOT)
+        label_dir = self.map_label_dir
         gts = MapEval.load_boxes(label_dir)
         if not gts:
             print(f"[mAP] WARNING: no ground truth in {label_dir} — "

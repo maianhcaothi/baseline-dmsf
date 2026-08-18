@@ -135,10 +135,15 @@ Outside the portable contract, and off by default. Points that are easy to break
   devices reach the same frame and the first writer must win. `map/pred/` and
   `map/collect/` are deleted in `DmsfServer.__init__` — a surviving write-once
   cache wins forever and run N+1 silently reuses run N's predictions.
-- `map/label/` is ground truth and is never deleted. `make_map_labels.py`
-  generates **pseudo** labels (the same model at split 10, conf 0.25), so the
-  scores read as *agreement with the deepest-cut reference*, not as VisDrone
-  accuracy. Never quote them as model accuracy.
+- Ground truth lives at `map.label_path` (blank = `<log-path>/map/label`;
+  relative resolves against `log-path`). `DmsfMapEval.resolve_label_dir` is the
+  single resolver — the server and `make_map_labels.py` both call it, so the
+  setting moves the write and the read together. Never rebuild the path from
+  `LABEL_ROOT` in new code. It is never deleted: `purge_scratch` takes the
+  resolved dir and refuses to purge a scratch root that contains it.
+- `make_map_labels.py` generates **pseudo** labels (the same model at split 10,
+  conf 0.25), so the scores read as *agreement with the deepest-cut reference*,
+  not as VisDrone accuracy. Never quote them as model accuracy.
 - A cluster with no matched frames is omitted with a warning, never written as
   `0.0000` — that would be a real accuracy claim, and a false one.
 - **`map.enable: true` makes the run's timing numbers non-comparable** with a

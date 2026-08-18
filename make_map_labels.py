@@ -4,7 +4,8 @@ The distributed run reads a video, and a video has no labels. This script makes
 the only reference that is actually available here: **the same model, run in one
 process at the deepest cut, at a confidence threshold high enough that its
 output is worth treating as truth.** It writes one file per frame to
-``<log-path>/map/label/frame_NNNNNN.txt`` in the layout ``DmsfMapEval`` reads:
+``map.label_path`` (default ``<log-path>/map/label``) as ``frame_NNNNNN.txt``,
+in the layout ``DmsfMapEval`` reads:
 
     class_id x_center y_center width height        (normalised to imgsz)
 
@@ -14,7 +15,7 @@ accuracy. They are *agreement between the configuration under test and the
 deepest-cut reference*: run the pipeline at ``split-point: 7`` against labels
 made at split point 10 and ``map.log`` answers "what did cutting shallower cost
 the output", which is a real DMSF question and the one this test bed can
-actually answer. Drop real labels into ``map/label/`` in the same layout and
+actually answer. Point ``map.label_path`` at real labels in the same layout and
 every number becomes a real mAP with no code change.
 
 Frame numbering is the video's own 1-based frame position, which is exactly what
@@ -24,6 +25,14 @@ the pipeline derives from the edge's batch id (``batch_id * batch_size + offset
     python make_map_labels.py                      # whole video, split 10, conf 0.25
     python make_map_labels.py --limit 512           # first 512 frames only
     python make_map_labels.py --split-point 10 --conf 0.30
+    python make_map_labels.py --label-path D:/labels/visdrone_ref   # elsewhere
+
+The destination comes from the SAME resolver the server scores with
+(``DmsfMapEval.resolve_label_dir``), so ``map.label_path`` moves the write and
+the read together. ``--label-path`` overrides it for one invocation — useful for
+building a second reference set without editing the config, but the server will
+not find that set unless the config points there too, so it prints where it
+wrote and what the config currently says.
 """
 import argparse
 import os
@@ -35,6 +44,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
+import DmsfMapEval as MapEval
 from models.dmsf_26n import DMSF26n
 from utils.metrics import non_max_suppression
 
@@ -56,6 +66,8 @@ def main():
     ap.add_argument('--batch', type=int, default=None)
     ap.add_argument('--limit', type=int, default=0, help='0 = the whole video')
     ap.add_argument('--device', default=None)
+    ap.add_argument('--label-path', default=None,
+                    help='override map.label_path for this run only')
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -68,7 +80,11 @@ def main():
     device = torch.device(args.device
                           or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    out_dir = os.path.join(log_path, 'map', 'label')
+    # One resolver, shared with the server (DmsfMapEval.resolve_label_dir): a
+    # generator that writes where the scorer does not look fills a folder
+    # nothing reads, and the run reports "no ground truth" for a set that exists.
+    configured = MapEval.resolve_label_dir(config.get('map') or {}, log_path)
+    out_dir = os.path.abspath(args.label_path or configured)
     os.makedirs(out_dir, exist_ok=True)
 
     model = DMSF26n(nc=int(dmsf.get('nc', 10))).to(device)
@@ -85,6 +101,10 @@ def main():
           f"iou={args.iou}")
     print(f"  video: {data}")
     print(f"  -> {out_dir}/frame_NNNNNN.txt   (class cx cy w h, normalised)")
+    if os.path.abspath(configured) != out_dir:
+        print(f"  NOTE: --label-path overrides the config, which still points at")
+        print(f"        {os.path.abspath(configured)} — the server scores THAT.")
+        print(f"        Set map.label_path to this folder before the next run.")
     print("  map.log therefore reads as AGREEMENT WITH THIS REFERENCE,")
     print("  never as VisDrone accuracy. Quote it that way.")
     print("=" * 72)

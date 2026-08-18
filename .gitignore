@@ -28,6 +28,11 @@ setup.json
 # NB: gitignore has no trailing comments; a comment after a pattern becomes
 # part of the pattern and the rule silently never matches.
 hosts.json
+# info/ holds the fleet runbook, the host list and the LOGIN PASSWORDS of all
+# 14 machines in plaintext. origin is a public GitHub repo: one `git add -A`
+# without this rule publishes every credential, and a push cannot be taken
+# back — the objects stay reachable even after a force-push.
+info/
 
 # deploy.ps1 must never be able to overwrite the three files above: they are
 # what makes each host itself. git cannot touch an ignored file, which is the

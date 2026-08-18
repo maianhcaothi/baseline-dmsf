@@ -117,11 +117,42 @@ fleet — every host is attempted and the closing table is the report, which als
 warns when the fleet ends up on more than one commit. Runs from a mixed fleet are
 not comparable.
 
+### Replacing the input video across the fleet
+
+`deploy.ps1` moves **code**, by pull, and deliberately never copies files. The
+video is the opposite case — `*.mp4` is gitignored, so git cannot carry it and a
+copy is the only way. `push_data.ps1` does that, from the same `hosts.json`:
+
+```powershell
+# DRY RUN by default: prints the old and new path per host, changes nothing
+powershell -ExecutionPolicy Bypass -File push_data.ps1 -Source dai@<host>:/path/video.mp4
+powershell -ExecutionPolicy Bypass -File push_data.ps1 -Source dai@<host>:/path/video.mp4 -Apply
+```
+
+It stages the file once, then for each host: asks that host where its **own**
+`data:` points (config.yaml is per-host, so the old path is a fact only it
+holds), copies to a `.incoming` temp name, verifies SHA-256 on both ends, moves
+it into place, and only then deletes the old file. A host that fails keeps its
+old video and is reported — a partially updated fleet is called out loudly,
+because a run across a mixed fleet is not comparable with anything.
+
+> **It also deletes `map/label/`.** Ground truth is generated *from* the video,
+> so labels made from the old one describe frames that no longer exist. Leaving
+> them would score the new video's detections against the old video's frames —
+> plausible numbers, entirely false. Regenerate with `python make_map_labels.py`
+> before any run with `map.enable: true`. `-KeepLabels` opts out; do not use it
+> unless the video genuinely did not change.
+
 Execution policy on this machine is `AllSigned`, so both `.ps1` scripts need:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File deploy.ps1 -DryRun
 ```
+
+That invocation used to crash `deploy.ps1` on `Join-Path`: `$PSScriptRoot` is
+empty inside a `param()` block under `powershell -File`, so the `hosts.json`
+default resolved to nothing. Both scripts now resolve the script root in the
+body instead.
 
 Each run writes **all fourteen** result logs to `log-path`, in the portable
 format specified in `guide/` (**cluster** naming scheme), plus this project's own
@@ -191,7 +222,7 @@ or none.
 low-threshold detections **write-once** to
 `map/pred/<cluster>/frame_NNNNNN.txt` (`class cx cy w h conf`, normalised to
 `imgsz`), ships them at shutdown, and the server scores them against
-`map/label/frame_NNNNNN.txt` with two independent pipelines: a 16-batch sliding
+`<map.label_path>/frame_NNNNNN.txt` with two independent pipelines: a 16-batch sliding
 window (step 1) into `map_window.log`, and one score over every matched frame
 into `map.log`. Frame numbers come from the **edge's** batch id, which travels in
 the message — several edges replaying the same video hit the same frame, and
@@ -205,8 +236,19 @@ python make_map_labels.py            # whole video, split 10, conf 0.25
 
 That writes **pseudo** ground truth: the same model at the deepest cut. `map.log`
 therefore reads as *agreement with the deepest-cut reference*, not as VisDrone
-accuracy — quote it that way, or drop real labels into `map/label/` in the same
-layout and every number becomes a real mAP with no code change.
+accuracy — quote it that way, or point `map.label_path` at real labels in the
+same layout and every number becomes a real mAP with no code change.
+
+`map.label_path` is where the ground truth lives; blank keeps the default
+`<log-path>/map/label`, a relative value resolves against `log-path`, an
+absolute one is taken as given. The generator and the server share one resolver
+(`DmsfMapEval.resolve_label_dir`), so the setting moves the write and the read
+together — `make_map_labels.py --label-path <dir>` overrides it for one
+invocation and says so, since the server still scores whatever the config names.
+Only the **server** ever reads labels; no device does. Only frames present in
+both folders are scored, so a partial label set narrows what is scored instead
+of counting the rest as misses. The server prints the folder and its file count
+at startup, so a wrong path costs a line rather than a whole run.
 
 > **Never measure accuracy and throughput in the same run.** The prediction pass
 > and the per-frame file write sit inside `get input → output`, so they land in

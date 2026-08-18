@@ -25,7 +25,7 @@ summary at the end is the report.
 #>
 [CmdletBinding()]
 param(
-    [string]  $Inventory = (Join-Path $PSScriptRoot 'hosts.json'),
+    [string]  $Inventory,
     [string[]]$Only,
     [string]  $Ref = 'origin/main',
     [switch]  $DryRun,
@@ -33,7 +33,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-Location $PSScriptRoot
+
+# $PSScriptRoot is EMPTY inside param() when the script is launched with
+# `powershell -File` -- which is the form the README documents, because the
+# execution policy here is AllSigned and the in-session `.\deploy.ps1` form is
+# not available. The default therefore crashed the script on Join-Path before it
+# read a single host. Resolve the root in the BODY, where the automatic variable
+# is populated, and fall back to MyInvocation for the -File path.
+$root = if ($PSScriptRoot) { $PSScriptRoot }
+        else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+Set-Location $root
+if (-not $Inventory) { $Inventory = Join-Path $root 'hosts.json' }
 
 # ---------------------------------------------------------------- inventory --
 if (-not (Test-Path $Inventory)) {
